@@ -91,6 +91,12 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        if std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1") {
+            bytes.extend_from_slice(b"VICTORY_NAN_SCRUB=1");
+        }
+        if std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1") {
+            bytes.extend_from_slice(b"VICTORY_BVH_MISS=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

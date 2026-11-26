@@ -30,6 +30,7 @@ if not exist "%runner%" (
   exit /b 2
 )
 if not defined VICTORY_AMBIENT_AIR set "VICTORY_AMBIENT_AIR=1.5"
+if not defined VICTORY_AMBIENT_MOST set "VICTORY_AMBIENT_MOST=2"
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-pareto"
 if not defined VICTORY_TEXTURE_NO_WAIT set "VICTORY_TEXTURE_NO_WAIT=1"
 if not defined VICTORY_RELAY set "VICTORY_RELAY=2"
@@ -46,30 +47,43 @@ if not defined VICTORY_SHOW_AFTER set "VICTORY_SHOW_AFTER=1"
 rem A constant, not the frame estimate: walking into a bright doorway raised
 rem the estimate and washed the whole frame out. constant:1.0 is even light.
 if not defined VICTORY_AMBIENT set "VICTORY_AMBIENT=constant:0.8"
+rem Scrub NaN/Inf on pixel color outputs and float image stores so bad values
+rem never smear through bloom, blur, or temporal upscaling on NVIDIA.
+if not defined VICTORY_NAN_SCRUB set "VICTORY_NAN_SCRUB=1"
+rem Skip walking stale/unbuilt BVH nodes while the ray-tracing builder is off.
+if not defined VICTORY_BVH_MISS set "VICTORY_BVH_MISS=1"
+rem NVIDIA caps shader-visible view heaps at 1,000,000; expand dynamic slots so
+rem complex scenes never drop draws.
+if not defined VICTORY_DYNAMIC_SLOTS set "VICTORY_DYNAMIC_SLOTS=458752"
 rem The write guard misses some titles' writes: skin on a guard's arms and the
 rem phone's frame read garbage (colour noise) until every check hashed the
 rem texture again. Costs some CPU; the frame rate held at 5-7 fps here.
 if not defined VICTORY_TEXTURE_GUARD set "VICTORY_TEXTURE_GUARD=0"
-rem The asynchronous submission paths stay off on NVIDIA: with THIN the head
-rem skin of people in play is not drawn (eyes and teeth are), and JOIN_PARTS
-rem repeats frames of the opening video. Set them to 1 to try instead.
-rem Keep async submission preparation ON even with THIN off: without this,
-rem setting VICTORY_THIN=0 accidentally turned off VICTORY_ASYNC_SUBMIT too,
-rem blocking the title's render thread synchronously on every submission.
-if not defined VICTORY_ASYNC_SUBMIT set "VICTORY_ASYNC_SUBMIT=1"
+rem Keep THIN/JOIN_PARTS/ASYNC_SUBMIT off on NVIDIA: THIN drops character head
+rem skin, JOIN_PARTS repeats intro frames, and forcing ASYNC_SUBMIT with THIN=0
+rem caused pre-gameplay crashes on some setups.
 if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 if not defined VICTORY_WIDE_SPIN set "VICTORY_WIDE_SPIN=50"
 if not defined VICTORY_D3D12_BACKGROUND set "VICTORY_D3D12_BACKGROUND=0"
+rem Renderer Ports 1, 5, 6 (zero-copy 32-bit graphics heap, zero-copy root CBVs,
+rem lock-free/RwLock write-guard claims + parallel refresh planning).
+if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=1"
+if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=1"
+if not defined VICTORY_PORT_GUARD set "VICTORY_PORT_GUARD=1"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
-rem Series S default: native 1920x1080 output (prevents stale 4K settings.xml
-rem from overflowing 8 GB VRAM) and 256 MiB Resizable BAR direct GDDR7 windows
-rem (falls back automatically if unsupported). Pass "series-x" to run Series X.
+rem Series S default: force Rockstar's own temporal upscaler (VICTORY_UPSCALER=6)
+rem instead of AMD FidelityFX FSR (7), which fails Wave32 translation on NVIDIA,
+rem smears postprocessing like a watercolor painting, and crashes before gameplay.
+rem Output stays native 1920x1080 (2/3 internal = 1280x720, retail Series S).
+rem Redirect up to 1024 MiB of loose title windows into Resizable BAR GDDR7
+rem (capped automatically at 80%% VRAM) to prevent 16 GB RAM shared-memory OOM.
 if /i "%console_profile%"=="series-s" (
   if not defined VICTORY_OUTPUT set "VICTORY_OUTPUT=1920x1080"
-  if not defined VICTORY_WINDOWS_BAR_MB set "VICTORY_WINDOWS_BAR_MB=256"
+  if not defined VICTORY_UPSCALER set "VICTORY_UPSCALER=6"
+  if not defined VICTORY_WINDOWS_BAR_MB set "VICTORY_WINDOWS_BAR_MB=1024"
 )
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 rem Controls: WASD (LAlt=walk), IJKL/Numpad (or F4 for Mouse Look + LMB/RMB),

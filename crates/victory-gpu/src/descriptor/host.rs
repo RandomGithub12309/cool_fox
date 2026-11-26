@@ -1497,7 +1497,18 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .unwrap_or(DYNAMIC << 2)
     });
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        // On NVIDIA (1,000,000 view heap cap), allow VICTORY_DYNAMIC_SLOTS to
+        // grow the dynamic descriptor pool up to half the heap so complex
+        // scenes do not exhaust 2^18 dynamic slots and drop draws.
+        static CAPPED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        return *CAPPED.get_or_init(|| {
+            let asked = std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse::<u32>().ok());
+            let slots = asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, null / 2);
+            if slots != DYNAMIC {
+                tracing::info!(slots, title_in_place = null - slots, "dynamic descriptor slots on capped view heap");
+            }
+            slots
+        });
     }
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
@@ -4265,10 +4276,11 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
-            if crate::port_cbv::on() {
+            if crate::port_cbv::on() && twin.is_some() {
                 // Renderer port 5: shaders read constant buffers as raw bytes
                 // through the twin; a constant buffer view there would be read
-                // raw, with no end on AMD.
+                // raw, with no end on AMD. On NVIDIA (capped view heap, no
+                // twins) shaders still read `at` as a CBV, so fall through.
                 return constant_twinned(&shadow.buffer, gpu, size, at, twin).then(|| Some(shadow.buffer.clone()));
             }
             if gpu % 256 != 0 {
