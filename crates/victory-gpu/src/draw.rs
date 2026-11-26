@@ -1637,13 +1637,24 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        // Share freshly-made dynamic tables across stages of the same draw
+        // (`VICTORY_TABLE_STAGES`, on unless `0`): when e.g. mesh + pixel
+        // stages read the same root table to different depths, both ask for the
+        // max span so the second stage hits `fresh_tables` instead of
+        // duplicating dynamic descriptor slots (~24% fewer dynamic slots).
+        let spans = if Self::table_stages() && p.stages.len() > 1 {
+            Self::stage_spans(p)
+        } else {
+            Few::default()
+        };
+        let mut staged: Few<(u64, u32), 8> = Few::default();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, compute, &spans, &mut staged);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3644,11 +3655,39 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+/// Whether the stages of one draw share freshly-made dynamic descriptor tables
+/// (`VICTORY_TABLE_STAGES`; on unless `0`). Saves ~24% of dynamic descriptor
+/// slots on NVIDIA's 1M-capped view heap and reduces recording CPU time.
+fn table_stages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_STAGES").is_none_or(|v| v != "0"))
+}
+
+/// Per root table slot read by any stage of `p`: `(slot, max_slots_with_cbv, max_slots_all)`.
+fn stage_spans(p: &HostPipeline) -> Few<(u8, u32, u32), 8> {
+    let mut spans: Few<(u8, u32, u32), 8> = Few::default();
+    for stage in &p.stages {
+        for group in &stage.translated().tables.groups {
+            let n = group.max_dword / 8 + 1;
+            let with = if group.has_cbv { n } else { 0 };
+            if let Some(s) = spans.iter_mut().find(|s| s.0 == group.slot) {
+                s.1 = s.1.max(with);
+                s.2 = s.2.max(n);
+            } else {
+                spans.push((group.slot, with, n));
+            }
+        }
+    }
+    spans
+}
+
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
+        spans: &[(u8, u32, u32)],
+        staged: &mut Few<(u64, u32), 8>,
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
@@ -3708,6 +3747,15 @@ impl State {
             selected.sort_unstable();
             selected.dedup();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            let n = match spans.iter().find(|s| s.0 == slot) {
+                Some(&(_, with_constants, all)) => {
+                    let past = heap
+                        .index(table)
+                        .is_some_and(|at| u64::from(at) + u64::from(all) > u64::from(host.count()));
+                    n.max(if past { all } else { with_constants })
+                }
+                None => n,
+            };
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -3744,10 +3792,22 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
+                let staged_title = staged
+                    .iter()
+                    .any(|&(t, len)| t == table && len == n)
+                    .then(|| heap.index(table).filter(|at| at + n <= host.count()))
+                    .flatten();
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        if let Some(title) = staged_title
+                            && crate::descriptor::host::is_texture_view(&view)
+                        {
+                            let k = u.table_offset_dwords / 8;
+                            host.texture_slot_tabled(title + k, true);
+                            host.mirror(title + k, handle, true);
+                        }
                     }
                 }
                 for k in selected {
@@ -3788,6 +3848,9 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            if !spans.is_empty() {
+                staged.push((table, n));
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of

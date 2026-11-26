@@ -66,11 +66,13 @@ if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 if not defined VICTORY_WIDE_SPIN set "VICTORY_WIDE_SPIN=50"
 if not defined VICTORY_D3D12_BACKGROUND set "VICTORY_D3D12_BACKGROUND=0"
-rem Renderer Ports 1, 5, 6 (zero-copy 32-bit graphics heap, zero-copy root CBVs,
-rem lock-free/RwLock write-guard claims + parallel refresh planning).
+rem Renderer Ports 1, 5, 6, 7 (zero-copy 32-bit graphics heap, zero-copy root
+rem CBVs, shared-lock/per-block write guards + parallel planning, partitioned
+rem journal tracking & early descriptor sync).
 if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=1"
 if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=1"
 if not defined VICTORY_PORT_GUARD set "VICTORY_PORT_GUARD=1"
+if not defined VICTORY_PORT_JOURNAL set "VICTORY_PORT_JOURNAL=1"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"

@@ -2278,8 +2278,9 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    /// Work that may write title memory; with optional written span `(at, len)`
+    /// when known (title memory-to-memory copies) for [`near_writes`].
+    Run(Box<dyn Fn() + Send>, Option<(usize, usize)>),
     /// Work that writes host memory only, and the title memory it reads
     /// (from, to; empty for none).
     Host(Box<dyn Fn() + Send>, (usize, usize)),
@@ -2656,11 +2657,20 @@ mod relay_tests {
 /// descriptor slots, upload
 /// memory and scratch chunks are held until then, and a frame's lists held
 /// all at once ran the slots out before (run 45).
+/// Whether flights get more room before settling (`VICTORY_SETTLE_ROOM`, on
+/// unless `0`): twice the in-flight list cap (256 -> 512) and higher changed-run
+/// merge limits under shader writes, eliminating unnecessary CPU waits.
+fn settle_room() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_ROOM").is_none_or(|v| v != "0"))
+}
+
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most * 2 } else { most }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3058,7 +3068,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(..) => return Some(WHY_RUN),
                 Step::Placed(p) => match p.waits(written) {
                     place::Waits::No => {}
                     place::Waits::ForReaders => placed.push((p.dst, p.dst + p.len)),
@@ -3114,7 +3124,13 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        let mut runs_left = if card_steps::stage() > 0 {
+            if settle_room() { 16384 } else { 4096 }
+        } else if settle_room() {
+            4096
+        } else {
+            512
+        };
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
     }
@@ -3157,7 +3173,7 @@ fn joins_asked() -> (usize, usize) {
 /// those give their shaders, write back or write when they are done, and it
 /// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
-    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
+    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(..)))) {
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
@@ -7327,9 +7343,20 @@ impl HostList {
 
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
+    #[allow(dead_code)]
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
-        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.copies.push(Step::Run(Box::new(work), None));
+        deferred.title_written();
+        drop(deferred);
+        self.changed_something();
+    }
+
+    /// Runs `work` when the list is submitted, knowing it writes only inside
+    /// `[at, at + len)` of title memory ([`near_writes`]).
+    pub(crate) fn defer_at(&self, at: usize, len: usize, work: impl Fn() + Send + 'static) {
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work), Some((at, len))));
         deferred.title_written();
         drop(deferred);
         self.changed_something();
@@ -7394,7 +7421,11 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    batch.title_written();
+                    if near_writes() {
+                        let _ = batch.title_wrote_near(dst, len);
+                    } else {
+                        batch.title_written();
+                    }
                     crate::port::copied(dst, src, len);
                     // Renderer port #7: into a heap's records, the rounds
                     // asked earlier did not see it.
@@ -7450,11 +7481,31 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work, _) => {
+                Step::Run(work, Some((at, len))) if near_writes() => {
                     batch.fill();
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
-                    if matches!(step, Step::Run(_)) {
+                    let written = batch.title_wrote_near(*at, *len);
+                    if written.iter().any(|&(a, b)| crate::descriptor::in_shader_heap(a, b - a)) {
+                        crate::port_journal::prep_wrote();
+                    }
+                    let _step = crate::timeline::span("a step of ours");
+                    work();
+                    for &(a, b) in &written {
+                        crate::watch::wrote(a, b - a);
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Runs, 1);
+                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                    }
+                    continue;
+                }
+                Step::Run(work, _) | Step::Host(work, _) => {
+                    batch.fill();
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
+                    if matches!(step, Step::Run(..)) {
                         batch.title_written();
                         // (It may write anywhere, a heap's records too.)
                         crate::port_journal::prep_wrote();
@@ -7463,7 +7514,7 @@ impl HostList {
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
-                    if matches!(step, Step::Run(_)) {
+                    if matches!(step, Step::Run(..)) {
                         crate::watch::ask_once_end();
                     }
                     #[cfg(feature = "diagnostics")]
@@ -7492,6 +7543,12 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
+                        if near_writes() {
+                            batch.texture_spans.insert(
+                                std::sync::Arc::as_ptr(staging) as *const () as usize,
+                                staging.memory(),
+                            );
+                        }
                         batch.due.push(staging.clone());
                         if !wide_textures() {
                             batch.refresh_textures();
@@ -7739,6 +7796,9 @@ struct Batch {
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
     textures: std::collections::HashSet<usize>,
+    /// Title memory spans `(address, bytes)` of staging buffers in `textures`
+    /// for targeted invalidation ([`near_writes`]).
+    texture_spans: ByCopy<(usize, usize)>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
@@ -8136,6 +8196,15 @@ fn wide_fills() -> bool {
 /// buffer then holds (`texture.rs`, `dirty`) may come ahead of the refresh
 /// an earlier list of the submission asked for, not behind it. The texture
 /// is then uploaded by a later list too, once more than needed.
+/// Whether a write of ours at a known address (`Step::Copy` or `Step::Run`
+/// with a known destination range) flushes/invalidates only overlapping
+/// refreshes & textures instead of clearing the entire submission batch
+/// (`VICTORY_NEAR_WRITES`; on unless `0`).
+fn near_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NEAR_WRITES").is_none_or(|v| v != "0"))
+}
+
 fn wide_textures() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
@@ -8214,6 +8283,60 @@ impl Batch {
         self.flush();
         self.ahead.clear();
         self.textures.clear();
+        self.texture_spans.clear();
+    }
+
+    /// Targeted invalidation for a write into `[at, at + len)` of title memory
+    /// (`VICTORY_NEAR_WRITES`, on unless `0`): flushes only overlapping
+    /// refreshes and invalidates only overlapping `ahead` and `textures`
+    /// entries instead of clearing the entire submission batch (~126x/frame).
+    fn title_wrote_near(&mut self, at: usize, len: usize) -> Vec<(usize, usize)> {
+        const K64: usize = 1 << 16;
+        const NEAR_VIEW_PAGES: usize = 64;
+        const NEAR_PENDING: usize = 4096;
+        let end = at.saturating_add(len);
+        let mut written = vec![(at, end)];
+        let mut whole = self.refreshes.len() > NEAR_PENDING || !self.due.is_empty();
+        if !whole && len > 0 {
+            let (first, last) = (at / K64, end.div_ceil(K64));
+            if last.saturating_sub(first) > NEAR_VIEW_PAGES {
+                whole = true;
+            } else {
+                for page in first..last {
+                    for other in crate::inplace::pages_of(page * K64) {
+                        if other != page * K64 {
+                            written.push((other, other + K64));
+                        }
+                    }
+                }
+            }
+        }
+        if whole {
+            self.title_written();
+            return written;
+        }
+        let touches = |from: usize, to: usize| written.iter().any(|&(a, b)| from < b && a < to);
+        if !self.refreshes.is_empty() {
+            let pending = std::mem::take(&mut self.refreshes);
+            let (due, keep): (Vec<_>, Vec<_>) = pending.into_iter().partition(|r| touches(r.1, r.2));
+            if !due.is_empty() {
+                self.refreshes = due;
+                self.flush();
+            }
+            self.refreshes = keep;
+            self.index = self
+                .refreshes
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (std::sync::Arc::as_ptr(&r.0) as usize, i))
+                .collect();
+        }
+        let spans = &self.texture_spans;
+        self.textures.retain(|key| spans.get(key).is_some_and(|&(a, n)| !touches(a, a.saturating_add(n))));
+        let textures = &self.textures;
+        self.texture_spans.retain(|key, _| textures.contains(key));
+        self.ahead.retain(|_, &mut (from, to)| !touches(from, to));
+        written
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -8252,6 +8375,12 @@ impl Batch {
             for front in &fronts {
                 for staging in &front.textures {
                     if self.texture_due(staging) {
+                        if near_writes() {
+                            self.texture_spans.insert(
+                                std::sync::Arc::as_ptr(staging) as *const () as usize,
+                                staging.memory(),
+                            );
+                        }
                         due.push(staging.clone());
                     }
                 }
@@ -8379,7 +8508,7 @@ impl Batch {
                     }
                     Step::GpuWrite(shadow, ..) => Touch::Write(std::sync::Arc::as_ptr(shadow) as usize),
                     Step::Copy(..) if taken(list, i) => Touch::Nothing,
-                    Step::Copy(..) | Step::Run(_) | Step::Placed(_) => break 'steps,
+                    Step::Copy(..) | Step::Run(..) | Step::Placed(_) => break 'steps,
                     _ => Touch::Nothing,
                 });
             }

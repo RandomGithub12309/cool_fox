@@ -1342,17 +1342,42 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
-        let at = from + k;
-        let Some(slice) = physical.slice_at(at) else {
+    if from == 0 || len == 0 {
+        return true;
+    }
+    let pages = len / PAGE;
+    let mut slices: Vec<Slice> = Vec::with_capacity(pages);
+    for i in 0..pages {
+        let Some(slice) = physical.slice_at(from + i * PAGE) else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        slices.push(slice);
+    }
+    // Coalesce consecutive slices of the same section into one host view to
+    // avoid per-page MapViewOfFile3 calls and cross-core TLB shootdowns.
+    let mut i = 0;
+    while i < slices.len() {
+        let first = &slices[i];
+        let run = 1 + slices[i + 1..]
+            .iter()
+            .zip(1..)
+            .take_while(|&(s, k)| Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k)
+            .count();
+        let at = to + i * PAGE;
+        let run_bytes = run * PAGE;
+        if run > 1 {
+            coalesce_placeholder(at, run_bytes);
+            if !map(&mut physical, at, run_bytes, first.clone()) {
+                for k in 0..run {
+                    if !map(&mut physical, at + k * PAGE, PAGE, slices[i + k].clone()) {
+                        return false;
+                    }
+                }
+            }
+        } else if !map(&mut physical, at, PAGE, first.clone()) {
             return false;
         }
+        i += run;
     }
     true
 }
@@ -1535,19 +1560,20 @@ impl Drop for Busy {
     }
 }
 
-/// A page of address space to unmap and, with a slice, map anew.
+/// A contiguous run of pages of address space to unmap and, with a slice, map anew.
 struct Op {
     at: usize,
+    len: usize,
     slice: Option<Slice>,
-    /// A view of this page alone is there, to be unmapped.
+    /// A single existing view matching `[at, at + len)` is there, to be unmapped.
     had: bool,
-    /// The placeholder is the page's own (or will be, after the unmapping).
+    /// The placeholder is the run's own (or will be, after the unmapping).
     own: bool,
 }
 
 impl Op {
     fn new(at: usize, slice: Option<Slice>) -> Op {
-        Op { at, slice, had: false, own: false }
+        Op { at, len: PAGE, slice, had: false, own: false }
     }
 
     /// The system calls; whether the host did as asked.
@@ -1568,15 +1594,77 @@ impl Op {
         let Some(slice) = &self.slice else {
             return true;
         };
-        show(self.at, PAGE, slice, self.own)
+        if show(self.at, self.len, slice, self.own) {
+            return true;
+        }
+        if self.len > PAGE {
+            // Fall back to per-page mapping if adjacent placeholders could not be coalesced.
+            let pages = self.len / PAGE;
+            for k in 0..pages {
+                let page_slice = Slice { section: slice.section.clone(), index: slice.index + k };
+                if !show(self.at + k * PAGE, PAGE, &page_slice, false) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
     }
 }
 
-/// Does `ops`, each of another page, side by side: first what is noted of
-/// the pages goes, then the system calls, then what is there now is noted.
-/// With [`PHYSICAL`] and the change of mapping (`title_memory_remapping`)
+/// Coalesces consecutive single-page [`Op`]s that target adjacent virtual
+/// addresses and either both unmap or map consecutive slices of one section.
+/// Cuts kernel MapViewOfFile3/UnmapViewOfFile2 calls and cross-core TLB
+/// shootdowns dramatically on contiguous streaming batches.
+fn coalesce_ops(ops: Vec<Op>) -> Vec<Op> {
+    if ops.len() < 2 {
+        return ops;
+    }
+    let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+    for op in ops {
+        if let Some(last) = out.last_mut()
+            && last.at + last.len == op.at
+        {
+            let mergeable = match (&last.slice, &op.slice) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    Arc::ptr_eq(&a.section, &b.section) && b.index == a.index + last.len / PAGE
+                }
+                _ => false,
+            };
+            if mergeable {
+                last.len += op.len;
+                continue;
+            }
+        }
+        out.push(op);
+    }
+    out
+}
+
+/// Coalesces any adjacent placeholders covering `[base, base + len)` so a
+/// multi-page view can replace them in one `MapViewOfFile3` call.
+fn coalesce_placeholder(base: usize, len: usize) {
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    if len <= PAGE {
+        return;
+    }
+    // SAFETY: acts only on adjacent placeholders within one reservation; harmless no-op otherwise.
+    unsafe {
+        VirtualFree(
+            base as *mut c_void,
+            len,
+            MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+        );
+    }
+}
+
+/// Does `ops`, each of a disjoint address range, side by side: first what is
+/// noted of the pages goes, then the system calls, then what is there now is
+/// noted. With [`PHYSICAL`] and the change of mapping (`title_memory_remapping`)
 /// held.
-fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
+fn change(physical: &mut Physical, ops: Vec<Op>) -> bool {
+    let mut ops = coalesce_ops(ops);
     for op in &mut ops {
         let there = physical
             .views
@@ -1585,30 +1673,45 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             .filter(|(base, view)| op.at < **base + view.0)
             .map(|(base, view)| (*base, view.0));
         match there {
-            Some((base, PAGE)) if base == op.at => {
+            Some((base, size)) if base == op.at && size == op.len => {
                 if let Some((size, slice)) = physical.views.remove(&op.at) {
                     shown_mut().forget(op.at, size, &slice);
                 }
-                victory_gpu::title_memory_unmapping(op.at, PAGE);
+                victory_gpu::title_memory_unmapping(op.at, op.len);
                 physical.holes.remove(&op.at);
                 (op.had, op.own) = (true, lean());
             }
-            // Part of a larger view.
+            // Part of a larger view, or a multi-page run spanning existing views.
             Some(_) => {
-                unmap(physical, op.at, PAGE);
+                unmap(physical, op.at, op.len);
             }
-            None => {}
+            None => {
+                if op.len > PAGE {
+                    // A multi-page op might start in a hole and overlap views later in the span.
+                    unmap(physical, op.at, op.len);
+                }
+            }
         }
         if op.had {
             continue;
         }
-        op.own = physical.holes.remove(&op.at) == Some(PAGE) && lean();
-        if op.slice.is_some() && !op.own {
-            // Cut out of a larger placeholder here, not side by side: a
-            // thread that maps a piece while others cut the same one can
-            // fail.
-            split(op.at, PAGE);
-            op.own = true;
+        if op.len > PAGE {
+            let end = op.at + op.len;
+            physical.holes.retain(|&h, _| h < op.at || h >= end);
+            if op.slice.is_some() {
+                coalesce_placeholder(op.at, op.len);
+                split(op.at, op.len);
+                op.own = true;
+            }
+        } else {
+            op.own = physical.holes.remove(&op.at) == Some(PAGE) && lean();
+            if op.slice.is_some() && !op.own {
+                // Cut out of a larger placeholder here, not side by side: a
+                // thread that maps a piece while others cut the same one can
+                // fail.
+                split(op.at, PAGE);
+                op.own = true;
+            }
         }
     }
     let done = pool::all(ops);
@@ -1617,13 +1720,13 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
         match op.slice {
             Some(slice) if done => {
                 // As in `map`.
-                shown_mut().note(op.at, PAGE, &slice);
-                victory_gpu::title_memory_remapped(op.at, PAGE);
-                victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
-                physical.views.insert(op.at, (PAGE, slice));
+                shown_mut().note(op.at, op.len, &slice);
+                victory_gpu::title_memory_remapped(op.at, op.len);
+                victory_gpu::title_memory_view(op.at, op.len, slice.section.handle as usize, (slice.index * PAGE) as u64);
+                physical.views.insert(op.at, (op.len, slice));
             }
             None if op.had && done => {
-                physical.holes.insert(op.at, PAGE);
+                physical.holes.insert(op.at, op.len);
             }
             _ => ok &= done,
         }
@@ -1744,7 +1847,7 @@ mod pool {
             .ops
             .iter()
             .map(|(op, done)| {
-                let op = Op { at: op.at, slice: op.slice.clone(), had: op.had, own: op.own };
+                let op = Op { at: op.at, len: op.len, slice: op.slice.clone(), had: op.had, own: op.own };
                 (op, done.load(Ordering::Acquire))
             })
             .collect()
