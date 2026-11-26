@@ -1724,10 +1724,25 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
 }
 
+/// VRAM admission check for one-shot character decoration/skin bakes: checks
+/// real local VRAM usage instead of subtracting speculative future target or
+/// buffer reservations, preventing 8 GB GPUs (especially in Series S mode)
+/// from starving character head/skin textures during the one-shot bake pass.
+#[cfg(windows)]
+pub(crate) fn room_for_bake(memory: Option<[u64; 4]>) -> bool {
+    match memory {
+        Some([budget, used, ..]) if budget > 0 => {
+            used.saturating_sub(crate::pool::texture_room()) < budget / 100 * 96
+        }
+        _ => true,
+    }
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (auto-scaled: 1,280 MiB
+/// on Series S, 2,048 MiB on <= 10 GiB Series X, 3,072 MiB on > 10 GiB Series X;
+/// 0: none, as before) less what such copies hold now.
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1749,7 +1764,21 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map(|mb| mb.min(8192) << 20)
+            .unwrap_or_else(|| {
+                if crate::console::current() == crate::console::Console::SeriesS {
+                    // Series S renders at 1080p-1440p (~1.0-1.3 GiB of targets):
+                    // keeping 3 GiB locked away starved textures & bakes on 8 GB GPUs.
+                    1280 << 20
+                } else {
+                    let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b);
+                    if budget.is_some_and(|b| b <= 10 << 30) {
+                        2048 << 20
+                    } else {
+                        3072 << 20
+                    }
+                }
+            })
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -1788,7 +1817,17 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map(|percent| percent.clamp(50, 97))
+            .unwrap_or_else(|| {
+                let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b);
+                if crate::console::current() == crate::console::Console::SeriesS
+                    && budget.is_some_and(|b| b <= 10 << 30)
+                {
+                    93
+                } else {
+                    90
+                }
+            })
     })
 }
 

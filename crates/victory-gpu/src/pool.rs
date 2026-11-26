@@ -98,7 +98,17 @@ pub(crate) fn on() -> bool {
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
     static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    *AHEAD.get_or_init(|| {
+        if let Some(asked) = std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()) {
+            return asked;
+        }
+        // On 8 GB VRAM cards (budget <= 10 GiB), pre-allocating 12 x 64 MiB
+        // (768 MiB) of empty VRAM blocks consumes ~10% of the card's budget.
+        // 4 ripe blocks (256 MiB) keep allocations ahead of in-flight lists
+        // while freeing 512 MiB of VRAM for textures and card buffers.
+        let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b);
+        if budget.is_some_and(|b| b <= 10 << 30) { 4 } else { 12 }
+    })
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how

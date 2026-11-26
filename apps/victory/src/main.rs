@@ -18,6 +18,19 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+// Request the discrete high-performance GPU on dual-GPU Windows laptops
+// (NVIDIA Optimus / AMD PowerXpress) so we never accidentally initialize on
+// an integrated GPU.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+pub static NvOptimusEnablement: u32 = 1;
+
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
 #[derive(Parser)]
 #[command(
     name = "victory",

@@ -120,7 +120,21 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    if on_card() {
+        256 << 20
+    } else if crate::residency::tight_host_ram() {
+        192 << 20
+    } else if crate::residency::limited_host_ram() {
+        384 << 20
+    } else {
+        768 << 20
+    }
+}
+
+/// Drops idle submission upload buffers when host memory is pressured.
+pub(super) fn trim() {
+    let freed = std::mem::take(&mut *SPARE.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(freed);
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -198,14 +212,22 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
+    let mut short_runs: Vec<Vec<(usize, usize)>> = Vec::with_capacity(dirty.len());
     for (_, ranges) in dirty {
         let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
+        let mut shorts = Vec::new();
+        let mut words = 0usize;
+        for &(a, b) in ranges {
+            if short(&(a, b)) {
+                words += (b - a) / 4;
+                shorts.push((a, b));
+            } else {
+                runs.push((a, at, b - a));
+                at += ((b - a) as u64).next_multiple_of(16);
+            }
         }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
         copies.push(Copy { runs, pairs: (at, words as u32) });
+        short_runs.push(shorts);
         at += (words as u64 * 8).next_multiple_of(16);
     }
     if at == 0 {
@@ -214,15 +236,15 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
+    for (((shadow, _), copy), shorts) in dirty.iter().zip(&copies).zip(&short_runs) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
         // (80,000 runs of some words a frame: in pieces of work.)
         let mut to = memory.data + copy.pairs.0 as usize;
-        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        for chunk in shorts.chunks(RUNS_AT_A_TIME) {
+            let words: usize = chunk.iter().map(|r| (r.1 - r.0) / 4).sum();
             if words > 0 {
-                work.push((from, ranges, to));
+                work.push((from, chunk, to));
                 to += words * 8;
             }
         }
@@ -230,18 +252,34 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
         let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|r| short(r)) {
-            for offset in (a..b).step_by(4) {
+        // Stage into an L1 cache-line buffer (64 bytes = 8 pairs) before
+        // streaming into Write-Combining upload memory to avoid partial WC flushes.
+        let mut line = [[0u32; 2]; 8];
+        let mut fill = 0usize;
+        for &(a, b) in ranges {
+            let mut offset = a;
+            while offset < b {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these
-                // ranges) and inside the memory, which has room for every
-                // pair, a piece of work's behind the last one's.
-                unsafe {
-                    let word = ((from + offset) as *const u32).read_unaligned();
-                    to.write([offset as u32, word]);
-                    to = to.add(1);
+                // ranges).
+                let word = unsafe { ((from + offset) as *const u32).read_unaligned() };
+                line[fill] = [offset as u32, word];
+                fill += 1;
+                if fill == 8 {
+                    // SAFETY: inside the memory, which has room for every
+                    // pair, a piece of work's behind the last one's.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(line.as_ptr(), to, 8);
+                        to = to.add(8);
+                    }
+                    fill = 0;
                 }
+                offset += 4;
             }
+        }
+        if fill > 0 {
+            // SAFETY: as above.
+            unsafe { std::ptr::copy_nonoverlapping(line.as_ptr(), to, fill) };
         }
     };
     crate::land::each_under(work.len(), &one);

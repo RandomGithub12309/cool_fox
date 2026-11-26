@@ -49,6 +49,54 @@ pub(crate) fn on_wine() -> bool {
 
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
+/// Live 64 KiB physical pages owned by the title (`XMemAllocatePhysicalPages`).
+static TITLE_PHYSICAL_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// Live bytes allocated through `XMemAllocDefault` (non-32-bit heap blocks).
+static TITLE_HEAP_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Live committed bytes allocated through `XMemVirtualAlloc` (`MEM_COMMIT`).
+static TITLE_VIRTUAL_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Base address -> committed bytes for `XMemVirtualAlloc` accounting.
+static TITLE_VIRTUAL_MAP: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(Default::default);
+
+fn note_virtual_commit(base: usize, size: usize) {
+    if base == 0 || size == 0 {
+        return;
+    }
+    let mut map = TITLE_VIRTUAL_MAP.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = map.insert(base, size).unwrap_or(0);
+    if size >= prev {
+        TITLE_VIRTUAL_BYTES.fetch_add(size - prev, Ordering::Relaxed);
+    } else {
+        TITLE_VIRTUAL_BYTES.fetch_sub(prev - size, Ordering::Relaxed);
+    }
+}
+
+fn note_virtual_free(base: usize, size: usize, release: bool) {
+    if base == 0 {
+        return;
+    }
+    let mut map = TITLE_VIRTUAL_MAP.lock().unwrap_or_else(|e| e.into_inner());
+    if release || size == 0 {
+        if let Some(prev) = map.remove(&base) {
+            TITLE_VIRTUAL_BYTES.fetch_sub(prev, Ordering::Relaxed);
+        }
+    } else if let Some(entry) = map.get_mut(&base) {
+        let drop_bytes = size.min(*entry);
+        *entry -= drop_bytes;
+        TITLE_VIRTUAL_BYTES.fetch_sub(drop_bytes, Ordering::Relaxed);
+        if *entry == 0 {
+            map.remove(&base);
+        }
+    }
+}
+
+fn title_owned_bytes() -> usize {
+    TITLE_PHYSICAL_PAGES
+        .load(Ordering::Relaxed)
+        .saturating_mul(PAGE)
+        .saturating_add(TITLE_VIRTUAL_BYTES.load(Ordering::Relaxed))
+        .saturating_add(TITLE_HEAP_BYTES.load(Ordering::Relaxed))
+}
 
 // Console additions to the host's flags.
 /// 2 MiB pages; the host reads this bit as large pages, which need a
@@ -178,6 +226,9 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     if !at.is_null() && !placeholder {
+        if kind & MEM_COMMIT != 0 {
+            note_virtual_commit(at as usize, size);
+        }
         victory_gpu::title_memory_allocated(at as usize, size);
     }
     note_protection(asked, kind, flags, at as usize, size);
@@ -347,6 +398,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
+        TITLE_HEAP_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         user.cast()
     }
 }
@@ -360,11 +412,13 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            note_virtual_free(address as usize, 0, true);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        TITLE_HEAP_BYTES.fetch_sub(size, Ordering::Relaxed);
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -697,6 +751,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // Title memory is touched without our locks: a fault there may wait for
     // a mapping call, which takes them.
     drop(table);
+    TITLE_PHYSICAL_PAGES.fetch_add(n, Ordering::Relaxed);
     for index in 0..n {
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(first + index * FRAMES) };
@@ -719,8 +774,10 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut table = page_table_mut();
     // Dropped without the lock: the last page of a section unmaps its window.
     let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
+    let freed = gone.len();
     drop(table);
     drop(gone);
+    TITLE_PHYSICAL_PAGES.fetch_sub(freed, Ordering::Relaxed);
     1
 }
 
@@ -1817,20 +1874,33 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    static EXACT: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("VICTORY_TITLE_WORKING_SET").is_none_or(|v| v != "0")
+    });
+    let owned = title_owned_bytes();
+    let title_used = if *EXACT {
+        // Report actual title-owned allocations rather than total Windows
+        // process commit (which includes 10-25 GiB of VIctory shadow mirrors,
+        // upload heaps, and D3D12 allocators and tricks Series S streaming
+        // into thinking it is 200-350% over its 7.6 GiB budget).
+        if owned > 0 {
+            owned.min(counters.PagefileUsage)
+        } else {
+            counters.PagefileUsage.min(64 * MIB)
+        }
+    } else {
+        counters.PagefileUsage
+    };
+    let physical_pages = TITLE_PHYSICAL_PAGES.load(Ordering::Relaxed);
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used,
+        physical_pages: u32::try_from(physical_pages).unwrap_or(u32::MAX),
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
     // What the title is told, logged at the first asking and at every
-    // 1,024th: "used" is all the process has committed, the layer's own
-    // memory and the card's included (27 GB in run 60's gameplay against a
-    // limit of 13.5 GB). A title that budgets its streaming from these two
-    // figures believes it is far over its limit.
-    // shortcut: the figure is not yet the title's own memory alone (its
-    // heaps and the pages it mapped); count those if this line shows the
-    // title asking.
+    // 1,024th.
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
     if asked.is_multiple_of(1024) {
@@ -1839,6 +1909,8 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
             which = _which,
             limit_mb = stats.title_limit >> 20,
             used_mb = stats.title_used >> 20,
+            process_commit_mb = counters.PagefileUsage >> 20,
+            physical_mb = (physical_pages * PAGE) >> 20,
             "the title asks how much memory it uses"
         );
     }
@@ -1874,6 +1946,7 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+        note_virtual_free(address as usize, size, kind & MEM_RELEASE != 0);
         victory_gpu::title_memory_freed(address as usize, size);
     }
     // SAFETY: the title's own arguments.

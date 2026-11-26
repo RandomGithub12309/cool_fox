@@ -38,14 +38,38 @@ fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
     if fast.len() == sets.len() { Vec::new() } else { fast }
 }
 
+/// Default `VICTORY_FAST_CORES` stage for a CPU topology.
+///
+/// On hybrid CPUs with many efficiency cores (8+ E-cores, e.g. Arrow Lake
+/// 8P+12E where E-cores have full 256-bit AVX2 and high IPC), pinning helper
+/// pools (`stage = 2`) onto only the P-cores oversubscribes them alongside
+/// the title's own threads while leaving 8–12 E-cores idle. Stage `1` keeps
+/// serial latency-critical threads (`victory-submit`, `victory-relay`,
+/// `victory-aside`, `victory-heap-sync`) on P-cores while letting parallel
+/// worker pools (`victory-wide`, `victory-land`, `victory-under`, etc.) use
+/// every physical core.
+fn default_stage_for(sets: &[(u32, u8)]) -> u32 {
+    let fast = fast_of(sets);
+    if !fast.is_empty() && sets.len().saturating_sub(fast.len()) >= 8 {
+        1
+    } else {
+        2
+    }
+}
+
 /// `VICTORY_FAST_CORES`: 0: no thread asks; 1: the threads a frame waits for
-/// one by one; 2 (the default): the threads they share their work with too;
+/// one by one; 2: the threads they share their work with too;
 /// 3: those that work beside the rest as well (lists translated, descriptors
 /// made): more threads by then than the fast cores run at a time, while the
 /// slow ones stood idle.
 fn stage() -> u32 {
     static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *STAGE.get_or_init(|| std::env::var("VICTORY_FAST_CORES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
+    *STAGE.get_or_init(|| {
+        std::env::var("VICTORY_FAST_CORES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| default_stage_for(&cpu_sets()))
+    })
 }
 
 /// Asks the system to run the calling thread, which a frame waits for, on

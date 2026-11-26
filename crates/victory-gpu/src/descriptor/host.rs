@@ -4719,6 +4719,15 @@ impl Copied<'_> {
 /// Most of a changed page is as it was: it is looked at sixteen records at a
 /// time.
 fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+    #[cfg(target_arch = "x86_64")]
+    if step == 32 && last.len() == records.len() {
+        static HAS_AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HAS_AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2")) {
+            // SAFETY: AVX2 was checked and both slices have equal length.
+            unsafe { changed_records_32_avx2(last, records, first, out) };
+            return;
+        }
+    }
     const AT_A_TIME: usize = 16;
     let block = AT_A_TIME * step;
     for (b, (old, new)) in last.chunks_mut(block).zip(records.chunks(block)).enumerate() {
@@ -4731,6 +4740,71 @@ fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out
                 out.push(first + (b * AT_A_TIME + n) as u32);
             }
         }
+    }
+}
+
+/// AVX2 fast path for 32-byte descriptor records (the standard D3D12 view size):
+/// skips 128 bytes (4 slots) per `vptest` when unchanged, and updates changed
+/// slots with a single 32-byte AVX2 store.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_records_32_avx2(last: &mut [u8], records: &[u8], first: u32, out: &mut Vec<u32>) {
+    use std::arch::x86_64::*;
+    let slots = last.len() / 32;
+    let dst = last.as_mut_ptr();
+    let src = records.as_ptr();
+    let mut s = 0usize;
+    while s + 4 <= slots {
+        let off = s * 32;
+        // SAFETY: `off + 128 <= last.len() == records.len()`.
+        unsafe {
+            let a0 = _mm256_loadu_si256(dst.add(off).cast());
+            let b0 = _mm256_loadu_si256(src.add(off).cast());
+            let d0 = _mm256_xor_si256(a0, b0);
+            let a1 = _mm256_loadu_si256(dst.add(off + 32).cast());
+            let b1 = _mm256_loadu_si256(src.add(off + 32).cast());
+            let d1 = _mm256_xor_si256(a1, b1);
+            let a2 = _mm256_loadu_si256(dst.add(off + 64).cast());
+            let b2 = _mm256_loadu_si256(src.add(off + 64).cast());
+            let d2 = _mm256_xor_si256(a2, b2);
+            let a3 = _mm256_loadu_si256(dst.add(off + 96).cast());
+            let b3 = _mm256_loadu_si256(src.add(off + 96).cast());
+            let d3 = _mm256_xor_si256(a3, b3);
+            let any = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
+            if _mm256_testz_si256(any, any) == 0 {
+                if _mm256_testz_si256(d0, d0) == 0 {
+                    _mm256_storeu_si256(dst.add(off).cast(), b0);
+                    out.push(first + s as u32);
+                }
+                if _mm256_testz_si256(d1, d1) == 0 {
+                    _mm256_storeu_si256(dst.add(off + 32).cast(), b1);
+                    out.push(first + s as u32 + 1);
+                }
+                if _mm256_testz_si256(d2, d2) == 0 {
+                    _mm256_storeu_si256(dst.add(off + 64).cast(), b2);
+                    out.push(first + s as u32 + 2);
+                }
+                if _mm256_testz_si256(d3, d3) == 0 {
+                    _mm256_storeu_si256(dst.add(off + 96).cast(), b3);
+                    out.push(first + s as u32 + 3);
+                }
+            }
+        }
+        s += 4;
+    }
+    while s < slots {
+        let off = s * 32;
+        // SAFETY: `off + 32 <= last.len() == records.len()`.
+        unsafe {
+            let a = _mm256_loadu_si256(dst.add(off).cast());
+            let b = _mm256_loadu_si256(src.add(off).cast());
+            let d = _mm256_xor_si256(a, b);
+            if _mm256_testz_si256(d, d) == 0 {
+                _mm256_storeu_si256(dst.add(off).cast(), b);
+                out.push(first + s as u32);
+            }
+        }
+        s += 1;
     }
 }
 

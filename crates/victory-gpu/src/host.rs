@@ -443,6 +443,8 @@ fn sweep() {
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
+        send::trim();
+        crate::shadow::trim_pool();
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
@@ -497,7 +499,13 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| {
-        let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
+        let default = if crate::residency::tight_host_ram() {
+            12
+        } else if crate::residency::limited_host_ram() {
+            16
+        } else {
+            64
+        };
         std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     })
 }
@@ -900,7 +908,18 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Explicitly prefer the discrete high-performance adapter on
+            // dual-GPU laptops (Intel iGPU + NVIDIA/AMD dGPU) so we never
+            // initialize on integrated graphics.
+            match high_performance_adapter() {
+                Some((adapter, name, vram_mb)) => {
+                    tracing::info!(adapter = %name, vram_mb, "selected high-performance D3D12 adapter");
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+                None => {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -994,6 +1013,32 @@ impl Host {
         let adapter = self.adapter.as_ref();
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
+    }
+}
+
+/// Picks the first non-software hardware adapter returned by
+/// `IDXGIFactory6::EnumAdapterByGpuPreference(DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)`.
+/// On hybrid laptops this guarantees the discrete GPU is chosen over an iGPU.
+fn high_performance_adapter() -> Option<(IDXGIAdapter1, String, u64)> {
+    // SAFETY: plain DXGI adapter enumeration.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut index = 0u32;
+        while let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+            index,
+            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+        ) {
+            index += 1;
+            let Ok(desc) = adapter.GetDesc1() else { continue };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..len]);
+            let vram_mb = (desc.DedicatedVideoMemory as u64) >> 20;
+            return Some((adapter, name, vram_mb));
+        }
+        None
     }
 }
 
@@ -1939,6 +1984,8 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
             let back = if scratch_pool() {
                 let limit = if keep_freed() && !crate::residency::limited_host_ram() {
                     SPARE_KEPT
+                } else if crate::residency::tight_host_ram() {
+                    SPARE_MOST / 2
                 } else {
                     SPARE_MOST
                 };

@@ -95,11 +95,29 @@ pub(crate) fn limited_host_ram() -> bool {
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
+/// True on 16 GB (<= 20 GiB) hosts where idle pools and loose-window caches
+/// must stay compact to prevent Windows pagefile thrashing.
+pub(crate) fn tight_host_ram() -> bool {
+    static TIGHT: OnceLock<bool> = OnceLock::new();
+    *TIGHT.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 20 * GIB))
+}
+
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     if was {
         physical < 5 * GIB || commit < 6 * GIB
     } else {
         physical <= 3 * GIB || commit <= 4 * GIB
+    }
+}
+
+fn next_pressure_for(was: bool, physical: u64, commit: u64, tight: bool) -> bool {
+    if !tight {
+        return next_pressure(was, physical, commit);
+    }
+    if was {
+        physical < 3584 * MIB || commit < 4 * GIB
+    } else {
+        physical <= 2 * GIB || commit <= 2560 * MIB
     }
 }
 
@@ -109,7 +127,7 @@ pub(crate) fn refresh() {
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let pressure = next_pressure_for(was, physical, commit, tight_host_ram());
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -185,6 +203,13 @@ mod tests {
         assert!(next_pressure(true, 6 * GIB, 5 * GIB));
         assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
         assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+        // Tight-RAM hosts (<= 20 GiB, e.g. 16 GB laptops): enter at <= 2 GiB phys
+        // or <= 2.5 GiB commit, recover at >= 3.5 GiB phys and >= 4 GiB commit.
+        assert!(!next_pressure_for(false, 3 * GIB, 4 * GIB, true));
+        assert!(next_pressure_for(false, 2 * GIB, 6 * GIB, true));
+        assert!(next_pressure_for(false, 5 * GIB, 2 * GIB, true));
+        assert!(next_pressure_for(true, 3 * GIB, 5 * GIB, true));
+        assert!(!next_pressure_for(true, (7 * GIB) / 2, 4 * GIB, true));
     }
 
     #[test]

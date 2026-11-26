@@ -83,6 +83,22 @@ fn a_panicking_job_reaches_the_caller() {
     }
 }
 
+/// Nested calls into the same pool (such as `host.rs` `wide_each` ->
+/// `Shadow::take_all` -> `wide_each`) run inline on the active thread instead
+/// of deadlocking on `Pool::turn`.
+#[test]
+fn nested_pool_calls_do_not_deadlock() {
+    let pool = Pool::new("victory-wide", 4);
+    let total = AtomicUsize::new(0);
+    pool.each(16, &|outer| {
+        pool.each(8, &|inner| {
+            total.fetch_add(outer * 8 + inner, Ordering::Relaxed);
+        });
+    });
+    let expected: usize = (0..16 * 8).sum();
+    assert_eq!(total.into_inner(), expected);
+}
+
 /// The order pieces are landed in holds every byte of every piece, under its
 /// copy, and no other; blocks come in order, pieces of several copies in one
 /// block stay in the order given, and jobs never cut a block.

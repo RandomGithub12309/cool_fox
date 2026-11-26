@@ -732,6 +732,13 @@ impl Layout {
             body.iter()
                 .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
         });
+        // Pre-divide run offsets by `chunk_size` and track the max offset so
+        // the inner row loop validates bounds once per row instead of per chunk.
+        let chunk_offsets: Vec<usize> = match chunk_size {
+            Some(size @ (8 | 16 | 32)) => body.iter().map(|&(offset, ..)| offset / size).collect(),
+            _ => Vec::new(),
+        };
+        let max_chunk_offset = chunk_offsets.iter().copied().max().unwrap_or(0);
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -744,17 +751,17 @@ impl Layout {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
                     match chunk_size {
                         Some(8) if tiled_row.is_multiple_of(8) => {
-                            copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
+                            copy_chunks::<8, DETILE>(src, dst, &chunk_offsets, max_chunk_offset, tiled_row / 8, linear_row)
                         }
                         Some(16) if tiled_row.is_multiple_of(16) => {
-                            copy_runs::<16, DETILE>(src, dst, body, tiled_row, linear_row)
+                            copy_chunks::<16, DETILE>(src, dst, &chunk_offsets, max_chunk_offset, tiled_row / 16, linear_row)
                         }
                         Some(32) if tiled_row.is_multiple_of(32) => {
-                            copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
+                            copy_chunks::<32, DETILE>(src, dst, &chunk_offsets, max_chunk_offset, tiled_row / 32, linear_row)
                         }
-                        _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
+                        _ => copy_runs_plain::<DETILE>(src, dst, body, tiled_row, linear_row),
                     }
-                    copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
+                    copy_runs_plain::<DETILE>(src, dst, last, tiled_row, linear_row);
                 }
             }
         }
@@ -777,31 +784,46 @@ fn copy_run<const DETILE: bool>(
     dst[to..][..len].copy_from_slice(&src[from..][..len]);
 }
 
-/// A row of equal runs is contiguous in linear memory. Treat it as a
-/// slice of arrays so only the tiled chunk needs a bounds check per copy.
-/// Use the byte ranges for irregular runs and the last run of each row.
-fn copy_runs<const N: usize, const DETILE: bool>(
+fn copy_runs_plain<const DETILE: bool>(
     src: &[u8],
     dst: &mut [u8],
     runs: &[(usize, usize, usize)],
     tiled_row: usize,
     linear_row: usize,
 ) {
-    if N == 0 {
-        for &(tiled, linear, len) in runs {
-            copy_run::<DETILE>(src, dst, tiled_row + tiled, linear_row + linear, len);
-        }
-    } else if DETILE {
+    for &(tiled, linear, len) in runs {
+        copy_run::<DETILE>(src, dst, tiled_row + tiled, linear_row + linear, len);
+    }
+}
+
+/// Copies a row of uniform `N`-byte chunks with one hoisted bounds check per
+/// row instead of one per chunk.
+fn copy_chunks<const N: usize, const DETILE: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    offsets: &[usize],
+    max_offset: usize,
+    tiled_row_chunk: usize,
+    linear_row: usize,
+) {
+    if offsets.is_empty() {
+        return;
+    }
+    if DETILE {
         let tiled = src.as_chunks::<N>().0;
-        let linear = dst[linear_row..][..runs.len() * N].as_chunks_mut::<N>().0;
-        for (out, &(offset, ..)) in linear.iter_mut().zip(runs) {
-            *out = tiled[(tiled_row + offset) / N];
+        let linear = dst[linear_row..][..offsets.len() * N].as_chunks_mut::<N>().0;
+        assert!(tiled_row_chunk + max_offset < tiled.len());
+        for (out, &off) in linear.iter_mut().zip(offsets) {
+            // SAFETY: `off <= max_offset` and `tiled_row_chunk + max_offset < tiled.len()`.
+            *out = unsafe { *tiled.get_unchecked(tiled_row_chunk + off) };
         }
     } else {
         let tiled = dst.as_chunks_mut::<N>().0;
-        let linear = src[linear_row..][..runs.len() * N].as_chunks::<N>().0;
-        for (input, &(offset, ..)) in linear.iter().zip(runs) {
-            tiled[(tiled_row + offset) / N] = *input;
+        let linear = src[linear_row..][..offsets.len() * N].as_chunks::<N>().0;
+        assert!(tiled_row_chunk + max_offset < tiled.len());
+        for (input, &off) in linear.iter().zip(offsets) {
+            // SAFETY: `off <= max_offset` and `tiled_row_chunk + max_offset < tiled.len()`.
+            unsafe { *tiled.get_unchecked_mut(tiled_row_chunk + off) = *input };
         }
     }
 }

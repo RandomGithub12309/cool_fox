@@ -61,24 +61,316 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
-    (0x1B, MENU), // Esc
-    (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
-    (0x08, B),    // Backspace
-    (b'X', X),
-    (b'Y', Y),
-    (0x26, UP), // arrows
-    (0x28, DOWN),
-    (0x25, LEFT),
-    (0x27, RIGHT),
-    (b'Q', LEFT_SHOULDER),
-    (b'E', RIGHT_SHOULDER),
-    (b'F', LEFT_STICK),
-    (b'H', RIGHT_STICK),
-];
+/// Virtual key codes for keyboard-to-controller mapping.
+const VK_BACK: u8 = 0x08;
+const VK_TAB: u8 = 0x09;
+const VK_RETURN: u8 = 0x0D;
+const VK_ESCAPE: u8 = 0x1B;
+const VK_SPACE: u8 = 0x20;
+const VK_LEFT: u8 = 0x25;
+const VK_UP: u8 = 0x26;
+const VK_RIGHT: u8 = 0x27;
+const VK_DOWN: u8 = 0x28;
+const VK_NUMPAD2: u8 = 0x62;
+const VK_NUMPAD4: u8 = 0x64;
+const VK_NUMPAD5: u8 = 0x65;
+const VK_NUMPAD6: u8 = 0x66;
+const VK_NUMPAD8: u8 = 0x68;
+const VK_LSHIFT: u8 = 0xA0;
+const VK_LCONTROL: u8 = 0xA2;
+const VK_LMENU: u8 = 0xA4;
+
+/// Slow-walk stick scale when holding the walk modifier (`Left Alt`).
+const WALK_SCALE: f32 = 0.45;
+
+/// Configurable keyboard-to-gamepad mapping (`VICTORY_KEYMAP`).
+///
+/// Default PC layout keeps all original VIctory keys working while adding
+/// ergonomic GTA/action PC bindings:
+/// - Left Stick: `W`/`A`/`S`/`D` (`LAlt` = slow walk)
+/// - Right Stick: `I`/`J`/`K`/`L`, Numpad `8`/`4`/`5`/`6` (or `2`), plus optional
+///   Mouse Look (`F4` toggle, or `VICTORY_MOUSE=1`)
+/// - Triggers: LT = `Z` / `U` (+ RMB in mouse mode), RT = `C` / `O` (+ LMB in mouse mode)
+/// - Face buttons: A = `LShift` / `Enter`, B = `R` / `Backspace`, X = `Space` / `X`, Y = `F` / `Y`
+/// - Shoulders: LB = `Q` (+ Mouse X1), RB = `E` (+ Mouse X2)
+/// - Stick clicks: LS = `LCtrl` / `G`, RS = `V` / `H` (+ MMB)
+/// - D-Pad: Arrow keys
+/// - Menu / View: `Esc` / `P`, `Tab` / `M`
+///
+/// Override any control with `VICTORY_KEYMAP=A=Space+Enter,X=LShift,RT=O` or
+/// use `VICTORY_KEYMAP=classic` for the minimal legacy bindings.
+#[derive(Clone, Debug)]
+struct KeyMap {
+    buttons: [(u32, Vec<u8>); 14],
+    left_trigger: Vec<u8>,
+    right_trigger: Vec<u8>,
+    left_up: Vec<u8>,
+    left_down: Vec<u8>,
+    left_left: Vec<u8>,
+    left_right: Vec<u8>,
+    right_up: Vec<u8>,
+    right_down: Vec<u8>,
+    right_left: Vec<u8>,
+    right_right: Vec<u8>,
+    walk: Vec<u8>,
+}
+
+impl KeyMap {
+    fn default_pc() -> Self {
+        Self {
+            buttons: [
+                (MENU, vec![VK_ESCAPE, b'P']),
+                (VIEW, vec![VK_TAB, b'M']),
+                (A, vec![VK_LSHIFT, VK_RETURN]),
+                (B, vec![b'R', VK_BACK]),
+                (X, vec![VK_SPACE, b'X']),
+                (Y, vec![b'F', b'Y']),
+                (UP, vec![VK_UP]),
+                (DOWN, vec![VK_DOWN]),
+                (LEFT, vec![VK_LEFT]),
+                (RIGHT, vec![VK_RIGHT]),
+                (LEFT_SHOULDER, vec![b'Q']),
+                (RIGHT_SHOULDER, vec![b'E']),
+                (LEFT_STICK, vec![VK_LCONTROL, b'G']),
+                (RIGHT_STICK, vec![b'V', b'H']),
+            ],
+            left_trigger: vec![b'Z', b'U'],
+            right_trigger: vec![b'C', b'O'],
+            left_up: vec![b'W'],
+            left_down: vec![b'S'],
+            left_left: vec![b'A'],
+            left_right: vec![b'D'],
+            right_up: vec![b'I', VK_NUMPAD8],
+            right_down: vec![b'K', VK_NUMPAD5, VK_NUMPAD2],
+            right_left: vec![b'J', VK_NUMPAD4],
+            right_right: vec![b'L', VK_NUMPAD6],
+            walk: vec![VK_LMENU],
+        }
+    }
+
+    fn classic() -> Self {
+        Self {
+            buttons: [
+                (MENU, vec![VK_ESCAPE]),
+                (VIEW, vec![VK_TAB]),
+                (A, vec![VK_RETURN]),
+                (B, vec![VK_BACK]),
+                (X, vec![b'X']),
+                (Y, vec![b'Y']),
+                (UP, vec![VK_UP]),
+                (DOWN, vec![VK_DOWN]),
+                (LEFT, vec![VK_LEFT]),
+                (RIGHT, vec![VK_RIGHT]),
+                (LEFT_SHOULDER, vec![b'Q']),
+                (RIGHT_SHOULDER, vec![b'E']),
+                (LEFT_STICK, vec![b'F']),
+                (RIGHT_STICK, vec![b'H']),
+            ],
+            left_trigger: vec![b'Z'],
+            right_trigger: vec![b'C'],
+            left_up: vec![b'W'],
+            left_down: vec![b'S'],
+            left_left: vec![b'A'],
+            left_right: vec![b'D'],
+            right_up: vec![b'I'],
+            right_down: vec![b'K'],
+            right_left: vec![b'J'],
+            right_right: vec![b'L'],
+            walk: Vec::new(),
+        }
+    }
+
+    fn parse(spec: &str) -> Self {
+        let mut map = Self::default_pc();
+        for token in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if token.eq_ignore_ascii_case("classic") {
+                map = Self::classic();
+                continue;
+            }
+            if token.eq_ignore_ascii_case("default") || token.eq_ignore_ascii_case("pc") {
+                map = Self::default_pc();
+                continue;
+            }
+            let Some((control, keys_spec)) = token.split_once('=') else {
+                tracing::warn!(entry = token, "VICTORY_KEYMAP: ignoring invalid entry (expected Control=Key)");
+                continue;
+            };
+            let vks: Vec<u8> = if keys_spec.trim().eq_ignore_ascii_case("none") {
+                Vec::new()
+            } else {
+                keys_spec
+                    .split('+')
+                    .filter_map(|k| {
+                        let parsed = parse_vk(k.trim());
+                        if parsed.is_none() {
+                            tracing::warn!(key = k.trim(), "VICTORY_KEYMAP: unknown key name");
+                        }
+                        parsed
+                    })
+                    .collect()
+            };
+            let target = match control.trim().to_ascii_uppercase().as_str() {
+                "MENU" | "START" => Some(&mut map.buttons[0].1),
+                "VIEW" | "BACK" | "SELECT" => Some(&mut map.buttons[1].1),
+                "A" => Some(&mut map.buttons[2].1),
+                "B" => Some(&mut map.buttons[3].1),
+                "X" => Some(&mut map.buttons[4].1),
+                "Y" => Some(&mut map.buttons[5].1),
+                "UP" | "DPAD_UP" => Some(&mut map.buttons[6].1),
+                "DOWN" | "DPAD_DOWN" => Some(&mut map.buttons[7].1),
+                "LEFT" | "DPAD_LEFT" => Some(&mut map.buttons[8].1),
+                "RIGHT" | "DPAD_RIGHT" => Some(&mut map.buttons[9].1),
+                "LB" | "L1" | "LEFT_SHOULDER" => Some(&mut map.buttons[10].1),
+                "RB" | "R1" | "RIGHT_SHOULDER" => Some(&mut map.buttons[11].1),
+                "LS" | "L3" | "LEFT_STICK" => Some(&mut map.buttons[12].1),
+                "RS" | "R3" | "RIGHT_STICK" => Some(&mut map.buttons[13].1),
+                "LT" | "L2" | "LEFT_TRIGGER" => Some(&mut map.left_trigger),
+                "RT" | "R2" | "RIGHT_TRIGGER" => Some(&mut map.right_trigger),
+                "LY+" | "LS_UP" => Some(&mut map.left_up),
+                "LY-" | "LS_DOWN" => Some(&mut map.left_down),
+                "LX-" | "LS_LEFT" => Some(&mut map.left_left),
+                "LX+" | "LS_RIGHT" => Some(&mut map.left_right),
+                "RY+" | "RS_UP" => Some(&mut map.right_up),
+                "RY-" | "RS_DOWN" => Some(&mut map.right_down),
+                "RX-" | "RS_LEFT" => Some(&mut map.right_left),
+                "RX+" | "RS_RIGHT" => Some(&mut map.right_right),
+                "WALK" => Some(&mut map.walk),
+                _ => {
+                    tracing::warn!(control = control.trim(), "VICTORY_KEYMAP: unknown controller input");
+                    None
+                }
+            };
+            if let Some(slot) = target {
+                *slot = vks;
+            }
+        }
+        map
+    }
+
+    fn from_env() -> Self {
+        match std::env::var("VICTORY_KEYMAP") {
+            Ok(spec) if !spec.trim().is_empty() => Self::parse(&spec),
+            _ => Self::default_pc(),
+        }
+    }
+
+    fn buttons_for(&self, vk: u8) -> u32 {
+        self.buttons
+            .iter()
+            .filter(|(_, vks)| vks.contains(&vk))
+            .fold(0, |all, (bit, _)| all | bit)
+    }
+
+    fn pad(&self, keys: &[KeyState]) -> PadState {
+        let any = |vks: &[u8]| vks.iter().any(|vk| keys.iter().any(|k| k.virtual_key == *vk));
+        let axis = |pos: &[u8], neg: &[u8]| f32::from(u8::from(any(pos))) - f32::from(u8::from(any(neg)));
+        let buttons = self
+            .buttons
+            .iter()
+            .filter(|(_, vks)| any(vks))
+            .fold(0, |all, (bit, _)| all | bit);
+        let (mut lx, mut ly) = normalize_stick(
+            axis(&self.left_right, &self.left_left),
+            axis(&self.left_up, &self.left_down),
+        );
+        if any(&self.walk) {
+            lx *= WALK_SCALE;
+            ly *= WALK_SCALE;
+        }
+        let (rx, ry) = normalize_stick(
+            axis(&self.right_right, &self.right_left),
+            axis(&self.right_up, &self.right_down),
+        );
+        PadState {
+            buttons,
+            left_trigger: if any(&self.left_trigger) { 1.0 } else { 0.0 },
+            right_trigger: if any(&self.right_trigger) { 1.0 } else { 0.0 },
+            left_x: lx,
+            left_y: ly,
+            right_x: rx,
+            right_y: ry,
+        }
+    }
+}
+
+fn normalize_stick(x: f32, y: f32) -> (f32, f32) {
+    let len_sq = x * x + y * y;
+    if len_sq > 1.0 {
+        let inv = len_sq.sqrt().recip();
+        (x * inv, y * inv)
+    } else {
+        (x, y)
+    }
+}
+
+fn parse_vk(name: &str) -> Option<u8> {
+    if name.len() == 1 {
+        let b = name.as_bytes()[0];
+        if b.is_ascii_alphanumeric() {
+            return Some(b.to_ascii_uppercase());
+        }
+    }
+    match name.to_ascii_uppercase().as_str() {
+        "SPACE" => Some(VK_SPACE),
+        "ENTER" | "RETURN" => Some(VK_RETURN),
+        "ESC" | "ESCAPE" => Some(VK_ESCAPE),
+        "TAB" => Some(VK_TAB),
+        "BACK" | "BACKSPACE" => Some(VK_BACK),
+        "UP" => Some(VK_UP),
+        "DOWN" => Some(VK_DOWN),
+        "LEFT" => Some(VK_LEFT),
+        "RIGHT" => Some(VK_RIGHT),
+        "LSHIFT" | "SHIFT" => Some(VK_LSHIFT),
+        "RSHIFT" => Some(0xA1),
+        "LCTRL" | "CTRL" | "LCONTROL" => Some(VK_LCONTROL),
+        "RCTRL" | "RCONTROL" => Some(0xA3),
+        "LALT" | "ALT" => Some(VK_LMENU),
+        "RALT" => Some(0xA5),
+        "CAPSLOCK" | "CAPS" => Some(0x14),
+        "INSERT" | "INS" => Some(0x2D),
+        "DELETE" | "DEL" => Some(0x2E),
+        "HOME" => Some(0x24),
+        "END" => Some(0x23),
+        "PGUP" | "PAGEUP" => Some(0x21),
+        "PGDN" | "PAGEDOWN" => Some(0x22),
+        "NUM0" => Some(0x60),
+        "NUM1" => Some(0x61),
+        "NUM2" => Some(VK_NUMPAD2),
+        "NUM3" => Some(0x63),
+        "NUM4" => Some(VK_NUMPAD4),
+        "NUM5" => Some(VK_NUMPAD5),
+        "NUM6" => Some(VK_NUMPAD6),
+        "NUM7" => Some(0x67),
+        "NUM8" => Some(VK_NUMPAD8),
+        "NUM9" => Some(0x69),
+        "F1" => Some(0x70),
+        "F2" => Some(0x71),
+        "F3" => Some(0x72),
+        "F4" => Some(0x73),
+        "F5" => Some(0x74),
+        "F6" => Some(0x75),
+        "F7" => Some(0x76),
+        "F8" => Some(0x77),
+        "F9" => Some(0x78),
+        "F10" => Some(0x79),
+        "F11" => Some(0x7A),
+        "F12" => Some(0x7B),
+        "MINUS" => Some(0xBD),
+        "EQUALS" => Some(0xBB),
+        "COMMA" => Some(0xBC),
+        "PERIOD" => Some(0xBE),
+        "SLASH" => Some(0xBF),
+        "SEMICOLON" => Some(0xBA),
+        "BRACKETL" | "[" => Some(0xDB),
+        "BRACKETR" | "]" => Some(0xDD),
+        _ => None,
+    }
+}
+
+fn keymap() -> &'static KeyMap {
+    static MAP: LazyLock<KeyMap> = LazyLock::new(KeyMap::from_env);
+    &MAP
+}
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
@@ -111,30 +403,16 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Optional mouse-to-controller overlay (right stick look + mouse buttons).
+    fn mouse_pad(&mut self) -> PadState {
+        PadState::default()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
-    let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
-            1.0
-        } else {
-            0.0
-        }
-    };
-    PadState {
-        buttons: FALLBACK_BUTTONS
-            .iter()
-            .filter(|(vk, _)| on(*vk) != 0.0)
-            .fold(0, |all, (_, bit)| all | bit),
-        left_trigger: on(b'Z'),
-        right_trigger: on(b'C'),
-        left_x: on(b'D') - on(b'A'),
-        left_y: on(b'W') - on(b'S'),
-        right_x: on(b'L') - on(b'J'),
-        right_y: on(b'I') - on(b'K'),
-    }
+    keymap().pad(keys)
 }
 
 /// Two pads as one: buttons of both, and of each axis and trigger the one
@@ -430,12 +708,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let keys = source.keys();
+            let mouse = source.mouse_pad();
+            (pads, keys, mouse)
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
+        let events = self.state().poll(&self.devices, self.one_pad, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -481,11 +761,13 @@ impl State {
         one_pad: bool,
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let kb_pad = merged(fallback(&keys), mouse);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
+            let pad = pads.into_iter().flatten().fold(kb_pad, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -494,7 +776,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(kb_pad));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1119,9 +1401,11 @@ pub(crate) fn module() -> HleModule {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, VK_F4, VK_LBUTTON, VK_MBUTTON,
+        VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1132,13 +1416,20 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, SetCursorPos,
     };
 
     use super::*;
 
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
+
+    /// Pixels per 8 ms poll tick that correspond to full right-stick deflection
+    /// at default sensitivity (`VICTORY_MOUSE_SENS=1.0`).
+    const MOUSE_FULL_STICK_PX: f32 = 24.0;
+    /// Per-tick exponential decay so mouse flicks remain visible to 30 FPS frames
+    /// (~4 polls/frame) and settle smoothly to zero within ~60 ms.
+    const MOUSE_DECAY: f32 = 0.65;
 
     const BUTTONS: [(u16, u32); 14] = [
         (XINPUT_GAMEPAD_START, MENU),
@@ -1174,9 +1465,48 @@ mod host {
         }
     }
 
-    #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Mouse-to-controller allowed (`VICTORY_MOUSE=0` disables completely).
+        mouse_allowed: bool,
+        /// Whether mouse look + mouse buttons are currently active (`F4` toggles).
+        mouse_look: bool,
+        /// Cursor centered at least once since `mouse_look` turned on.
+        mouse_anchored: bool,
+        /// Previous `F4` state for clean edge-triggered toggle.
+        f4_down: bool,
+        /// Smoothed right-stick velocity from mouse deltas.
+        mouse_vel: (f32, f32),
+        /// Right-stick mouse sensitivity (`VICTORY_MOUSE_SENS`, default 1.0).
+        mouse_sens: f32,
+        /// Invert vertical mouse look (`VICTORY_MOUSE_INVERT_Y=1`).
+        mouse_invert_y: bool,
+    }
+
+    impl Default for Host {
+        fn default() -> Self {
+            let env = std::env::var("VICTORY_MOUSE").ok();
+            let mouse_allowed = env.as_deref().map(str::trim) != Some("0");
+            let mouse_look = env.as_deref().map(str::trim) == Some("1");
+            let mouse_sens = std::env::var("VICTORY_MOUSE_SENS")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .unwrap_or(1.0)
+                .clamp(0.1, 10.0);
+            let mouse_invert_y =
+                std::env::var("VICTORY_MOUSE_INVERT_Y").ok().as_deref().map(str::trim) == Some("1");
+            Self {
+                empty_until: [None; PADS],
+                mouse_allowed,
+                mouse_look,
+                mouse_anchored: false,
+                f4_down: false,
+                mouse_vel: (0.0, 0.0),
+                mouse_sens,
+                mouse_invert_y,
+            }
+        }
     }
 
     impl Source for Host {
@@ -1198,10 +1528,9 @@ mod host {
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
+                let map = super::keymap();
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
+                    pad.buttons |= map.buttons_for(vk);
                 }
             }
             Some(pad)
@@ -1229,6 +1558,88 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn mouse_pad(&mut self) -> PadState {
+            if !self.mouse_allowed {
+                return PadState::default();
+            }
+            let Some(hwnd) = focused_window() else {
+                self.mouse_look = false;
+                self.mouse_anchored = false;
+                self.f4_down = false;
+                self.mouse_vel = (0.0, 0.0);
+                return PadState::default();
+            };
+            // SAFETY: plain key-state queries.
+            let f4 = unsafe { GetAsyncKeyState(i32::from(VK_F4)) } < 0;
+            if f4 && !self.f4_down {
+                self.mouse_look = !self.mouse_look;
+                self.mouse_anchored = false;
+                self.mouse_vel = (0.0, 0.0);
+                tracing::info!(
+                    mouse_look = self.mouse_look,
+                    "mouse-to-controller look toggled (F4)"
+                );
+            }
+            self.f4_down = f4;
+            // Pressing Esc releases cursor lock cleanly for pause menus / desktop.
+            if self.mouse_look && unsafe { GetAsyncKeyState(i32::from(super::VK_ESCAPE)) } < 0 {
+                self.mouse_look = false;
+                self.mouse_anchored = false;
+                self.mouse_vel = (0.0, 0.0);
+                tracing::info!("mouse-to-controller look released on Esc (press F4 to re-enable)");
+            }
+            if !self.mouse_look {
+                return PadState::default();
+            }
+
+            let mut rect = RECT::default();
+            // SAFETY: valid foreground window belonging to our process.
+            if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+                return PadState::default();
+            }
+            let cx = rect.left + (rect.right - rect.left) / 2;
+            let cy = rect.top + (rect.bottom - rect.top) / 2;
+            let mut pt = POINT::default();
+            let (dx, dy) = if self.mouse_anchored && unsafe { GetCursorPos(&mut pt) } != 0 {
+                (pt.x - cx, pt.y - cy)
+            } else {
+                self.mouse_anchored = true;
+                (0, 0)
+            };
+            // SAFETY: re-center cursor inside our own focused window.
+            unsafe { SetCursorPos(cx, cy) };
+
+            let scale = self.mouse_sens / MOUSE_FULL_STICK_PX;
+            let y_sign = if self.mouse_invert_y { 1.0 } else { -1.0 };
+            let mut vx = self.mouse_vel.0 * MOUSE_DECAY + (dx as f32) * scale;
+            let mut vy = self.mouse_vel.1 * MOUSE_DECAY + (dy as f32) * scale * y_sign;
+            let (nx, ny) = normalize_stick(vx, vy);
+            vx = if nx.abs() < 0.01 { 0.0 } else { nx };
+            vy = if ny.abs() < 0.01 { 0.0 } else { ny };
+            self.mouse_vel = (vx, vy);
+
+            // SAFETY: plain mouse-button queries while our window has focus.
+            let down = |vk: u16| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
+            let mut buttons = 0u32;
+            if down(VK_MBUTTON) {
+                buttons |= RIGHT_STICK;
+            }
+            if down(VK_XBUTTON1) {
+                buttons |= LEFT_SHOULDER;
+            }
+            if down(VK_XBUTTON2) {
+                buttons |= RIGHT_SHOULDER;
+            }
+            PadState {
+                buttons,
+                left_trigger: if down(VK_RBUTTON) { 1.0 } else { 0.0 },
+                right_trigger: if down(VK_LBUTTON) { 1.0 } else { 0.0 },
+                right_x: vx,
+                right_y: vy,
+                ..Default::default()
+            }
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1282,14 +1693,23 @@ mod host {
             .collect()
     }
 
-    /// The foreground window is one of ours (the title's or our fallback).
-    fn focused() -> bool {
+    /// The foreground window if it belongs to our process.
+    fn focused_window() -> Option<HWND> {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_null() {
+                return None;
+            }
+            GetWindowThreadProcessId(hwnd, &mut process);
+            (process == GetCurrentProcessId()).then_some(hwnd)
         }
+    }
+
+    /// The foreground window is one of ours (the title's or our fallback).
+    fn focused() -> bool {
+        focused_window().is_some()
     }
 
     #[test]
@@ -1705,5 +2125,52 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn pc_keymap_maps_ergonomic_keys_normalizes_diagonals_and_supports_overrides() {
+        let map = KeyMap::default_pc();
+        // Ergonomic PC buttons + triggers + numpad camera
+        let state = map.pad(&[
+            key(VK_LSHIFT),
+            key(b'R'),
+            key(VK_SPACE),
+            key(b'F'),
+            key(VK_LCONTROL),
+            key(b'V'),
+            key(b'U'),
+            key(b'O'),
+            key(VK_NUMPAD8),
+            key(b'P'),
+            key(b'M'),
+        ]);
+        assert_eq!(
+            state.buttons,
+            A | B | X | Y | LEFT_STICK | RIGHT_STICK | MENU | VIEW
+        );
+        assert_eq!((state.left_trigger, state.right_trigger, state.right_y), (1.0, 1.0, 1.0));
+
+        // Diagonal normalization on unit circle
+        let diag = map.pad(&[key(b'W'), key(b'D')]);
+        let len = (diag.left_x * diag.left_x + diag.left_y * diag.left_y).sqrt();
+        assert!((len - 1.0).abs() < 1e-5, "diagonal stick length {len}");
+        assert!((diag.left_x - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+        assert!((diag.left_y - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-5);
+
+        // Slow-walk modifier (Left Alt)
+        let walk = map.pad(&[key(b'W'), key(VK_LMENU)]);
+        assert!((walk.left_y - WALK_SCALE).abs() < 1e-5);
+
+        // Classic preset restores legacy F -> LEFT_STICK
+        let classic = KeyMap::parse("classic");
+        assert_eq!(classic.pad(&[key(b'F')]).buttons, LEFT_STICK);
+        assert_eq!(classic.pad(&[key(VK_SPACE)]).buttons, 0);
+
+        // Custom VICTORY_KEYMAP overrides
+        let custom = KeyMap::parse("A=Space+Enter,X=LShift,RT=K,LT=None");
+        assert_eq!(custom.pad(&[key(VK_SPACE)]).buttons, A);
+        assert_eq!(custom.pad(&[key(VK_LSHIFT)]).buttons, X);
+        assert_eq!(custom.pad(&[key(b'K')]).right_trigger, 1.0);
+        assert_eq!(custom.pad(&[key(b'Z'), key(b'U')]).left_trigger, 0.0);
     }
 }

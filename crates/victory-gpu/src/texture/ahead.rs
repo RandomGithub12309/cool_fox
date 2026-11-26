@@ -203,7 +203,8 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
+            let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 5).clamp(2, 4));
+            for n in 0..workers {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }

@@ -236,7 +236,17 @@ extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
         std::env::var("VICTORY_DSTORAGE_STAGING_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(256)
+            .unwrap_or_else(|| {
+                // Keep staging compact (128 MiB) on 16 GB hosts so DirectStorage
+                // does not compete with D3D12/title memory for physical RAM.
+                use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+                // SAFETY: zero-initialized structure with dwLength set.
+                let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+                status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+                let tight = unsafe { GlobalMemoryStatusEx(&mut status) } != 0
+                    && status.ullTotalPhys <= 20u64 << 30;
+                if tight { 128 } else { 256 }
+            })
     }) << 20;
     tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {

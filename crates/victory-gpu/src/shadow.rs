@@ -192,9 +192,26 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     }
 }
 
+/// Console-aware card buffer cap: on 8–12 GB GPUs running Series S (where
+/// render targets use ~1.2 GiB instead of Series X's ~3 GiB), raising the cap
+/// to 1,024 MiB keeps the title's skinning/render heap and small GPU buffers
+/// in fast local VRAM instead of spilling over PCIe and forcing 700 MB/frame
+/// CPU shader-write scans.
+fn default_card_limits_mb_for(local_vram_budget: Option<u64>, series_s: bool) -> (u64, u64) {
+    let (min_mb, max_mb) = default_card_limits_mb(local_vram_budget);
+    if let Some(budget_bytes) = local_vram_budget {
+        let budget_mb = budget_bytes >> 20;
+        if (6 * 1024..=12 * 1024).contains(&budget_mb) {
+            return (min_mb, if series_s { 1024 } else { 768 });
+        }
+    }
+    (min_mb, max_mb)
+}
+
 /// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
 /// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
 /// `VICTORY_CARD_BUFFERS_MB`.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_card_limits(
     local_vram_budget: Option<u64>,
     min_mb_override: Option<u64>,
@@ -207,20 +224,32 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
+fn resolve_card_limits_for(
+    local_vram_budget: Option<u64>,
+    series_s: bool,
+    min_mb_override: Option<u64>,
+    max_mb_override: Option<u64>,
+) -> (u64, u64) {
+    const MIB: u64 = 1 << 20;
+    let (default_min_mb, default_max_mb) = default_card_limits_mb_for(local_vram_budget, series_s);
+    let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
+    let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
+    (min_bytes, max_bytes)
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
 /// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
-/// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
-/// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
-/// on `>= 20 GiB` budgets), and explicit env vars always override.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let (mut min_bytes, max_bytes) = resolve_card_limits(
+        let series_s = crate::console::current() == crate::console::Console::SeriesS;
+        let (mut min_bytes, max_bytes) = resolve_card_limits_for(
             vram_budget,
+            series_s,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
             env_mb("VICTORY_CARD_BUFFERS_MB"),
         );
@@ -655,7 +684,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize, (usize, u32, u32))) -> usize {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.write().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
@@ -1295,17 +1324,23 @@ fn snapshots_kept() -> usize {
 }
 
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
-/// the largest, and of those the largest one and the next ones up to `KEPT`
+/// the largest, and of those the largest one and the next ones up to `kept_bytes`
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept_bytes: usize = if crate::residency::tight_host_ram() {
+        128 << 20
+    } else if crate::residency::limited_host_ram() {
+        256 << 20
+    } else {
+        512 << 20
+    };
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > kept_bytes {
             break;
         }
         kept += 1;
@@ -1313,6 +1348,12 @@ fn give_back(v: Vec<u8>) {
     // (Given back to the kernel without the lock: milliseconds.)
     let gone = pool.split_off(kept);
     drop(pool);
+    drop(gone);
+}
+
+/// Drops idle pooled snapshot buffers when host memory is pressured.
+pub(crate) fn trim_pool() {
+    let gone = std::mem::take(&mut *POOL.lock().unwrap_or_else(|e| e.into_inner()));
     drop(gone);
 }
 
@@ -1472,11 +1513,16 @@ struct Workers {
 }
 
 /// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
-/// most (0, the default: not at all): asleep, a thread is woken in 50 us and
-/// more, 95 times a frame.
+/// most (defaults to 50 us on >= 12-core CPUs, 0 otherwise): asleep, a thread
+/// is woken in 50 us and more, 95 times a frame.
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_SPIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| if std::thread::available_parallelism().is_ok_and(|n| n.get() >= 12) { 50 } else { 0 })
+    });
     if most == 0 {
         return;
     }
@@ -1490,7 +1536,7 @@ fn spin(there: impl Fn() -> bool) {
 
 /// How many threads are kept for [`wide`].
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 10)
 }
 
 fn workers() -> &'static Workers {
@@ -1584,24 +1630,7 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
-    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
-    let jobs = (0..threads)
-        .map(|_| {
-            let (next, work) = (next.clone(), work.clone());
-            Box::new(move || {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    work(i);
-                }
-            }) as Job
-        })
-        .collect();
-    wide(jobs);
+    crate::land::each_wide(n, &work);
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -1710,13 +1739,18 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     // (which holds the copy's bytes at the copy's offsets);
                     // nothing writes either while a submission's results
                     // are compared.
-                    let (now, old) = unsafe {
-                        (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
-                            std::slice::from_raw_parts((before + at) as *const u8, n),
-                        )
+                    let differed = unsafe {
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            crate::safecopy::differ((data + at) as *const u8, (before + at) as *const u8, n)
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        {
+                            std::slice::from_raw_parts((data + at) as *const u8, n)
+                                != std::slice::from_raw_parts((before + at) as *const u8, n)
+                        }
                     };
-                    if now != old {
+                    if differed {
                         pieces.push((at, n));
                     }
                     at += n;
@@ -1981,6 +2015,14 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        static HAS_AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if n >= 32 && *HAS_AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2")) {
+            // SAFETY: AVX2 was verified above and both slices have at least `n` bytes.
+            return unsafe { changed_runs_avx2(&now[..n], &was[..n]) };
+        }
+    }
     let mut runs = Vec::new();
     let mut i = 0;
     while i < n {
@@ -2003,6 +2045,86 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
             i += 1;
         }
         runs.push((first, i - first));
+    }
+    runs
+}
+
+/// AVX2 fast path for [`changed_runs`]: skips 128 unchanged bytes per `vptest`,
+/// then extracts exact differing byte runs via 32-byte `vpcmpeqb` + `vpmovmskb`.
+///
+/// # Safety
+/// Processor has AVX2 and `now.len() == was.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let n = now.len();
+    let a = now.as_ptr();
+    let b = was.as_ptr();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |from: usize, len: usize| match runs.last_mut() {
+        Some((start, cur)) if *start + *cur == from => *cur += len,
+        _ => runs.push((from, len)),
+    };
+    let mut i = 0usize;
+    while i + 128 <= n {
+        // SAFETY: `i + 128 <= n`.
+        let any_diff = unsafe {
+            let d0 = _mm256_xor_si256(_mm256_loadu_si256(a.add(i).cast()), _mm256_loadu_si256(b.add(i).cast()));
+            let d1 = _mm256_xor_si256(_mm256_loadu_si256(a.add(i + 32).cast()), _mm256_loadu_si256(b.add(i + 32).cast()));
+            let d2 = _mm256_xor_si256(_mm256_loadu_si256(a.add(i + 64).cast()), _mm256_loadu_si256(b.add(i + 64).cast()));
+            let d3 = _mm256_xor_si256(_mm256_loadu_si256(a.add(i + 96).cast()), _mm256_loadu_si256(b.add(i + 96).cast()));
+            let any = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
+            _mm256_testz_si256(any, any) == 0
+        };
+        if !any_diff {
+            i += 128;
+            continue;
+        }
+        for k in 0..4 {
+            let off = i + k * 32;
+            // SAFETY: `off + 32 <= i + 128 <= n`.
+            let eq = unsafe {
+                _mm256_cmpeq_epi8(_mm256_loadu_si256(a.add(off).cast()), _mm256_loadu_si256(b.add(off).cast()))
+            };
+            let mut differ = !(_mm256_movemask_epi8(eq) as u32);
+            while differ != 0 {
+                let first = differ.trailing_zeros();
+                let count = (differ >> first).trailing_ones();
+                push(off + first as usize, count as usize);
+                if first + count >= 32 {
+                    break;
+                }
+                differ &= u32::MAX << (first + count);
+            }
+        }
+        i += 128;
+    }
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n`.
+        let eq = unsafe { _mm256_cmpeq_epi8(_mm256_loadu_si256(a.add(i).cast()), _mm256_loadu_si256(b.add(i).cast())) };
+        let mut differ = !(_mm256_movemask_epi8(eq) as u32);
+        while differ != 0 {
+            let first = differ.trailing_zeros();
+            let count = (differ >> first).trailing_ones();
+            push(i + first as usize, count as usize);
+            if first + count >= 32 {
+                break;
+            }
+            differ &= u32::MAX << (first + count);
+        }
+        i += 32;
+    }
+    while i < n {
+        if now[i] != was[i] {
+            let first = i;
+            while i < n && now[i] != was[i] {
+                i += 1;
+            }
+            push(first, i - first);
+        } else {
+            i += 1;
+        }
     }
     runs
 }
@@ -2136,6 +2258,25 @@ unsafe fn word_runs_avx2(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     let n = title.len();
     let mut i = 0;
     while i + 256 <= n {
+        // Fast-skip 256 equal bytes with a single vptest before computing 8 movemasks.
+        let any_diff = unsafe {
+            let mut acc = _mm256_xor_si256(
+                _mm256_loadu_si256(title.as_ptr().add(i).cast()),
+                _mm256_loadu_si256(held.as_ptr().add(i).cast()),
+            );
+            for k in 1..8 {
+                let d = _mm256_xor_si256(
+                    _mm256_loadu_si256(title.as_ptr().add(i + 32 * k).cast()),
+                    _mm256_loadu_si256(held.as_ptr().add(i + 32 * k).cast()),
+                );
+                acc = _mm256_or_si256(acc, d);
+            }
+            _mm256_testz_si256(acc, acc) == 0
+        };
+        if !any_diff {
+            i += 256;
+            continue;
+        }
         let mut differ = 0u64;
         for k in 0..8 {
             // SAFETY: inside both slices (`i + 256 <= n`).
@@ -2748,7 +2889,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
             .values()
             .map(|s| {
@@ -2772,7 +2913,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
@@ -2813,7 +2954,7 @@ pub(crate) fn let_go_idle() {
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = loose_write();
         if map.is_empty() {
             return;
         }
@@ -2850,7 +2991,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -4858,7 +4999,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = loose_write();
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -4887,7 +5028,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -5132,7 +5273,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     cover(loose.keys().copied())
 }
 
@@ -5235,6 +5376,51 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
+/// How often [`LOOSE`] was taken to be changed.
+static LOOSE_CHANGED: AtomicU64 = AtomicU64::new(1);
+
+fn loose_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Arc<Shadow>>> {
+    let map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    LOOSE_CHANGED.fetch_add(1, Ordering::SeqCst);
+    map
+}
+
+const FOUND_LOOSE_MOST: usize = 512;
+
+thread_local! {
+    /// Per-thread direct-mapped cache of [`LOOSE`] window lookups keyed by
+    /// `(start, len)`, avoiding global `LOOSE` RwLock + BTreeMap traversal on
+    /// repeated draw buffer lookups.
+    static FOUND_LOOSE: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn found_loose_at(start: u64, len: u64) -> usize {
+    let h = (start ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> 55) as usize % FOUND_LOOSE_MOST
+}
+
+fn found_loose(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    let changed = LOOSE_CHANGED.load(Ordering::SeqCst);
+    let shadow = FOUND_LOOSE.with(|f| {
+        let f = f.borrow();
+        let (a, n, at, shadow) = f.get(found_loose_at(start, len))?;
+        ((*a, *n, *at) == (start, len, changed)).then(|| shadow.upgrade()).flatten()
+    })?;
+    // Matches `found`: whoever takes `loose_write` to let an idle window go
+    // sees strong_count > 1, or bumped `LOOSE_CHANGED` before this check.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    (LOOSE_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+}
+
+fn remember_loose(start: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+    FOUND_LOOSE.with(|f| {
+        let mut f = f.borrow_mut();
+        if f.is_empty() {
+            f.resize_with(FOUND_LOOSE_MOST, || (0, 0, 0, std::sync::Weak::new()));
+        }
+        f[found_loose_at(start, len)] = (start, len, changed, Arc::downgrade(shadow));
+    });
+}
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
@@ -5256,15 +5442,33 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
-    // The window is there already (nearly always): readers share the lock.
+    let quick = quick_find();
+    // The window is there already (nearly always): thread-local cache first,
+    // then shared read lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+        if quick && let Some(shadow) = found_loose(named.0, named.1) {
+            note(&shadow);
+            return Some(shadow);
+        }
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         if let Some(shadow) = map.get(&named) {
+            note(shadow);
+            if quick {
+                remember_loose(named.0, named.1, LOOSE_CHANGED.load(Ordering::SeqCst), shadow);
+            }
+            return Some(shadow.clone());
+        }
+    } else if any && fine() && !unsized_ask {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        if let Some(key) = holder(there, address, end)
+            && let Some(shadow) = map.get(&key)
+        {
             note(shadow);
             return Some(shadow.clone());
         }
     }
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let mut map = loose_write();
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))

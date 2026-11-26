@@ -677,11 +677,98 @@ fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ONCE").is_none_or(|v| v != "0"))
 }
 
-/// A 128-bit digest of `bytes`, to tell a texture's memory changed: four
-/// lanes of folded multiplications over 64 bytes at a time. (Not a
-/// cryptographic one, which took 0.27 ms a megabyte, four times the detiling
-/// it was to spare; nobody makes up textures to collide.)
+/// A 128-bit digest of `bytes`, to tell a texture's memory changed.
+/// Uses hardware AES-NI (8 independent 128-bit lanes = 128 bytes/iter,
+/// saturating L2/L3/DRAM bandwidth on modern x86_64 CPUs) when available,
+/// falling back to a 4-lane scalar folded multiplication digest.
 pub(crate) fn digest(bytes: &[u8]) -> Digest {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static HAS_AES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HAS_AES.get_or_init(|| std::arch::is_x86_feature_detected!("aes") && std::arch::is_x86_feature_detected!("sse4.1")) {
+            // SAFETY: AES-NI and SSE4.1 were verified above.
+            return unsafe { digest_aesni(bytes) };
+        }
+    }
+    digest_scalar(bytes)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "aes", enable = "sse4.1")]
+unsafe fn digest_aesni(bytes: &[u8]) -> Digest {
+    use std::arch::x86_64::*;
+    let len = bytes.len() as u64;
+    let len_vec = _mm_set_epi64x(
+        len.wrapping_mul(0x9e37_79b9_7f4a_7c15) as i64,
+        (len ^ 0xa076_1d64_78bd_642f) as i64,
+    );
+    let mut s0 = _mm_xor_si128(_mm_set_epi64x(0xa076_1d64_78bd_642fu64 as i64, 0xe703_7ed1_a0b4_28dbu64 as i64), len_vec);
+    let mut s1 = _mm_xor_si128(_mm_set_epi64x(0x8ebc_6af0_9c88_c6e3u64 as i64, 0x5899_65cc_7537_4cc3u64 as i64), len_vec);
+    let mut s2 = _mm_xor_si128(_mm_set_epi64x(0x1d8e_4e27_c47d_124fu64 as i64, 0xeb44_acca_b455_d165u64 as i64), len_vec);
+    let mut s3 = _mm_xor_si128(_mm_set_epi64x(0x9e37_79b9_7f4a_7c15u64 as i64, 0xc2b2_ae3d_27d4_eb4fu64 as i64), len_vec);
+    let mut s4 = _mm_xor_si128(_mm_set_epi64x(0x243f_6a88_85a3_08d3u64 as i64, 0x1319_8a2e_0370_7344u64 as i64), len_vec);
+    let mut s5 = _mm_xor_si128(_mm_set_epi64x(0xa409_3822_299f_31d0u64 as i64, 0x082e_fa98_ec4e_6c89u64 as i64), len_vec);
+    let mut s6 = _mm_xor_si128(_mm_set_epi64x(0x4528_21e6_38d0_1377u64 as i64, 0xbe54_66cf_34e9_0c6cu64 as i64), len_vec);
+    let mut s7 = _mm_xor_si128(_mm_set_epi64x(0xc0ac_29b7_c97c_50ddu64 as i64, 0x3f84_d5b5_b547_0917u64 as i64), len_vec);
+
+    let mut ptr = bytes.as_ptr();
+    let end = unsafe { ptr.add(bytes.len() & !127) };
+    while ptr < end {
+        // SAFETY: `ptr + 128 <= bytes.as_ptr() + bytes.len()`.
+        unsafe {
+            s0 = _mm_aesenc_si128(s0, _mm_loadu_si128(ptr.cast()));
+            s1 = _mm_aesenc_si128(s1, _mm_loadu_si128(ptr.add(16).cast()));
+            s2 = _mm_aesenc_si128(s2, _mm_loadu_si128(ptr.add(32).cast()));
+            s3 = _mm_aesenc_si128(s3, _mm_loadu_si128(ptr.add(48).cast()));
+            s4 = _mm_aesenc_si128(s4, _mm_loadu_si128(ptr.add(64).cast()));
+            s5 = _mm_aesenc_si128(s5, _mm_loadu_si128(ptr.add(80).cast()));
+            s6 = _mm_aesenc_si128(s6, _mm_loadu_si128(ptr.add(96).cast()));
+            s7 = _mm_aesenc_si128(s7, _mm_loadu_si128(ptr.add(112).cast()));
+            ptr = ptr.add(128);
+        }
+    }
+
+    let rem = bytes.len() & 127;
+    if rem > 0 {
+        let mut tail = [0u8; 128];
+        // SAFETY: `rem == bytes.len() - (end - bytes.as_ptr())`.
+        unsafe { std::ptr::copy_nonoverlapping(ptr, tail.as_mut_ptr(), rem) };
+        let t = tail.as_ptr();
+        // SAFETY: `tail` is 128 bytes.
+        unsafe {
+            s0 = _mm_aesenc_si128(s0, _mm_loadu_si128(t.cast()));
+            s1 = _mm_aesenc_si128(s1, _mm_loadu_si128(t.add(16).cast()));
+            s2 = _mm_aesenc_si128(s2, _mm_loadu_si128(t.add(32).cast()));
+            s3 = _mm_aesenc_si128(s3, _mm_loadu_si128(t.add(48).cast()));
+            s4 = _mm_aesenc_si128(s4, _mm_loadu_si128(t.add(64).cast()));
+            s5 = _mm_aesenc_si128(s5, _mm_loadu_si128(t.add(80).cast()));
+            s6 = _mm_aesenc_si128(s6, _mm_loadu_si128(t.add(96).cast()));
+            s7 = _mm_aesenc_si128(s7, _mm_loadu_si128(t.add(112).cast()));
+        }
+    }
+
+    // Asymmetric tree reduction with full AES avalanche rounds so every byte
+    // position and lane boundary diffuses across all 128 output bits.
+    let k0 = _mm_set_epi64x(0x9216_d5d9_8979_fb1bu64 as i64, 0xd131_0ba6_98df_b5acu64 as i64);
+    let k1 = _mm_set_epi64x(0x2ffd_72db_d01a_dfb7u64 as i64, 0xb8e1_afed_6a26_7e96u64 as i64);
+    let k2 = _mm_set_epi64x(0xba7c_9045_f12c_7f99u64 as i64, 0x24a1_9947_b391_6cf7u64 as i64);
+    let a0 = _mm_aesenc_si128(_mm_aesenc_si128(s0, k0), _mm_aesenc_si128(s1, k1));
+    let a1 = _mm_aesenc_si128(_mm_aesenc_si128(s2, k1), _mm_aesenc_si128(s3, k2));
+    let a2 = _mm_aesenc_si128(_mm_aesenc_si128(s4, k2), _mm_aesenc_si128(s5, k0));
+    let a3 = _mm_aesenc_si128(_mm_aesenc_si128(s6, k0), _mm_aesenc_si128(s7, k2));
+    let b0 = _mm_aesenc_si128(a0, _mm_aesenc_si128(a1, len_vec));
+    let b1 = _mm_aesenc_si128(a2, _mm_aesenc_si128(a3, k1));
+    let mut h = _mm_aesenc_si128(b0, _mm_aesenc_si128(b1, k2));
+    h = _mm_aesenc_si128(h, len_vec);
+    h = _mm_aesenc_si128(h, k0);
+
+    let mut out = [0u8; 16];
+    // SAFETY: `out` is 16 bytes.
+    unsafe { _mm_storeu_si128(out.as_mut_ptr().cast(), h) };
+    Digest(u128::from_le_bytes(out))
+}
+
+fn digest_scalar(bytes: &[u8]) -> Digest {
     const K: [u64; 8] = [
         0xa076_1d64_78bd_642f,
         0xe703_7ed1_a0b4_28db,

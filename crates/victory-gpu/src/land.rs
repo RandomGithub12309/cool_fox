@@ -29,7 +29,7 @@
 //! [`crate::watch::landed_beside`] notes the blocks written afterwards, so
 //! that the next refresh takes them as before.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 /// The unit pieces are cut in (of title memory), and the guards' blocks.
@@ -52,7 +52,7 @@ fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
         let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
-        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)).clamp(1, 16)
+        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 3).clamp(2, 8)).clamp(1, 16)
     })
 }
 
@@ -195,6 +195,43 @@ pub(crate) fn log(frames: f64) {
     );
 }
 
+/// Brief spin duration in microseconds before worker threads sleep on the
+/// condvar (`VICTORY_WIDE_SPIN`). Defaults to 50 us on high-core-count CPUs
+/// (>= 12 logical processors) to avoid ~50-80 us OS wakeup penalties across
+/// ~95 parallel batches per frame; set `VICTORY_WIDE_SPIN=0` to disable.
+fn spin_us() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_SPIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| if std::thread::available_parallelism().is_ok_and(|n| n.get() >= 12) { 50 } else { 0 })
+    })
+}
+
+// Tracks which `Pool` (by address) is currently executing on this thread
+// so nested calls into the same pool (for example `host.rs` `wide_each` ->
+// `Shadow::take_all` -> `wide_each`) run inline instead of deadlocking on
+// `Pool::turn`.
+thread_local! {
+    static ACTIVE_POOL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct PoolGuard(usize);
+
+impl PoolGuard {
+    fn enter(pool: usize) -> Self {
+        let prev = ACTIVE_POOL.replace(pool);
+        Self(prev)
+    }
+}
+
+impl Drop for PoolGuard {
+    fn drop(&mut self) {
+        ACTIVE_POOL.set(self.0);
+    }
+}
+
 /// Threads kept for landing, and the work they are at.
 struct Pool {
     state: Mutex<State>,
@@ -202,17 +239,30 @@ struct Pool {
     idle: Condvar,
     /// One batch at a time.
     turn: Mutex<()>,
+    /// Monotonic batch generation published atomically for brief spin-waits.
+    generation: AtomicU64,
+    /// Helpers currently executing the active batch.
+    running: AtomicUsize,
+    /// Next work item index (lock-free atomic work stealing).
+    next: AtomicUsize,
+    /// Total items in the active batch (set to 0 on panic to halt early).
+    count: AtomicUsize,
+    /// Whether any helper panicked in the active batch.
+    panicked: AtomicBool,
     threads: usize,
 }
 
 struct State {
     /// What to do with each number below `count`.
     work: Option<Work>,
-    next: usize,
-    count: usize,
-    /// Helpers inside a call.
+    /// Monotonic batch generation so helpers never re-enter a finished batch.
+    generation: u64,
+    /// Helpers currently executing the active batch.
     running: usize,
-    panicked: bool,
+    /// Helpers currently parked in `more.wait()`.
+    sleeping: usize,
+    /// Whether `each()` is currently parked in `idle.wait()`.
+    waiting_idle: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -229,16 +279,21 @@ impl Pool {
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
+            state: Mutex::new(State { work: None, generation: 0, running: 0, sleeping: 0, waiting_idle: false }),
             more: Condvar::new(),
             idle: Condvar::new(),
             turn: Mutex::new(()),
+            generation: AtomicU64::new(0),
+            running: AtomicUsize::new(0),
+            next: AtomicUsize::new(0),
+            count: AtomicUsize::new(0),
+            panicked: AtomicBool::new(false),
             threads,
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
-                if name == "victory-land" {
+                if name == "victory-land" || name == "victory-wide" {
                     crate::cores::keep_helper_on_fast_cores(name);
                 } else {
                     crate::cores::keep_many_on_fast_cores(name);
@@ -250,22 +305,68 @@ impl Pool {
     }
 
     fn help(&self) {
+        let mut seen = 0u64;
+        let spin = spin_us();
         let mut state = self.state();
         loop {
-            let Some((work, i)) = take(&mut state) else {
+            let work = loop {
+                if let Some(work) = state.work
+                    && state.generation != seen
+                {
+                    seen = state.generation;
+                    state.running += 1;
+                    self.running.store(state.running, Ordering::Release);
+                    break work;
+                }
+                seen = state.generation;
+                if spin > 0 {
+                    drop(state);
+                    let began = std::time::Instant::now();
+                    while self.generation.load(Ordering::Acquire) == seen
+                        && (began.elapsed().as_micros() as u64) < spin
+                    {
+                        for _ in 0..16 {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    state = self.state();
+                    if let Some(work) = state.work
+                        && state.generation != seen
+                    {
+                        seen = state.generation;
+                        state.running += 1;
+                        self.running.store(state.running, Ordering::Release);
+                        break work;
+                    }
+                    seen = state.generation;
+                }
+                state.sleeping += 1;
                 state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
-                continue;
+                state.sleeping -= 1;
             };
-            state.running += 1;
             drop(state);
             let working = crate::timeline::span("a landing's job");
+            let _active = PoolGuard::enter(std::ptr::from_ref(self) as usize);
             // SAFETY: counted in `running`, so `each` has not returned.
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                loop {
+                    let i = self.next.fetch_add(1, Ordering::Relaxed);
+                    if i >= self.count.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    unsafe { (*work.0)(i) };
+                }
+            }));
+            drop(_active);
             working.end();
+            if ran.is_err() {
+                self.panicked.store(true, Ordering::Relaxed);
+                self.count.store(0, Ordering::Relaxed);
+            }
             state = self.state();
             state.running -= 1;
-            state.panicked |= ran.is_err();
-            if state.running == 0 {
+            self.running.store(state.running, Ordering::Release);
+            if state.running == 0 && state.waiting_idle {
                 self.idle.notify_all();
             }
         }
@@ -274,36 +375,71 @@ impl Pool {
     /// Calls `f` with every number below `count`, on the pool's threads and
     /// this one, and returns when every call has.
     fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
-        if count < 2 || self.threads < 2 {
+        let me = std::ptr::from_ref(self) as usize;
+        if count < 2 || self.threads < 2 || ACTIVE_POOL.get() == me {
             (0..count).for_each(f);
             return;
         }
         let _spread = crate::timeline::span("landing: spread over threads");
         let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        let _active = PoolGuard::enter(me);
         // SAFETY: the lifetime is left out only until this call returns, and
         // it does not before no helper is inside `f` and none can enter.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
-        let mut state = self.state();
-        (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
-        drop(state);
-        if count > self.threads {
-            self.more.notify_all();
-        } else {
-            (1..count).for_each(|_| self.more.notify_one());
+        self.next.store(0, Ordering::Relaxed);
+        self.count.store(count, Ordering::Relaxed);
+        self.panicked.store(false, Ordering::Relaxed);
+        let wake = {
+            let mut state = self.state();
+            state.work = Some(work);
+            let generation = state.generation.wrapping_add(1);
+            state.generation = generation;
+            self.generation.store(generation, Ordering::Release);
+            state.sleeping
+        };
+        if wake > 0 {
+            if count >= self.threads {
+                self.more.notify_all();
+            } else {
+                (1..count).for_each(|_| self.more.notify_one());
+            }
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let Some((_, i)) = take(&mut self.state()) else { break };
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                if i >= self.count.load(Ordering::Relaxed) {
+                    break;
+                }
                 f(i);
             }
         }));
+        if ran.is_err() {
+            self.count.store(0, Ordering::Relaxed);
+        }
         let mut state = self.state();
         // (After a panic here: nothing more is begun.)
         state.work = None;
-        while state.running > 0 {
-            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        if state.running > 0 {
+            let spin = spin_us();
+            if spin > 0 {
+                drop(state);
+                let began = std::time::Instant::now();
+                while self.running.load(Ordering::Acquire) > 0
+                    && (began.elapsed().as_micros() as u64) < spin
+                {
+                    for _ in 0..16 {
+                        std::hint::spin_loop();
+                    }
+                }
+                state = self.state();
+            }
+            while state.running > 0 {
+                state.waiting_idle = true;
+                state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            state.waiting_idle = false;
         }
-        let panicked = state.panicked;
+        let panicked = self.panicked.load(Ordering::Relaxed);
         drop(state);
         if let Err(panic) = ran {
             std::panic::resume_unwind(panic);
@@ -312,43 +448,49 @@ impl Pool {
     }
 }
 
-/// The next number of the batch, if there is one.
-fn take(state: &mut State) -> Option<(Work, usize)> {
-    let work = state.work?;
-    if state.next >= state.count {
-        return None;
-    }
-    state.next += 1;
-    Some((work, state.next - 1))
-}
-
 /// [`Pool::each`] on the threads kept for landing.
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
 }
 
+/// [`Pool::each`] on threads kept for parallel host refreshes, fills, and
+/// texture refreshes (`crate::shadow::wide_each`), avoiding per-batch heap
+/// allocations and queue-mutex contention.
+pub(crate) fn each_wide(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map_or(5, |n| (n.get() / 2).clamp(3, 10));
+        Pool::new("victory-wide", threads)
+    })
+    .each(count, f);
+}
+
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes
-/// (`VICTORY_UNDER_THREADS`, 6 with this one).
+/// (`VICTORY_UNDER_THREADS`, scales up to 10 on high-core CPUs).
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
+        let default = std::thread::available_parallelism().map_or(6, |n| (n.get() / 2).clamp(6, 10));
+        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
         Pool::new("victory-under", threads.clamp(1, 16))
     })
     .each(count, f);
 }
 
 /// Calls `f` with every number below `count`, on this thread and on threads
-/// kept for making descriptors (`VICTORY_VIEW_THREADS`, 4 with this one, 6 for records; 1:
-/// on this one alone). Those for `records`, the heaps' records copied as
-/// bytes, are others than those for the views picked by index: submissions
-/// wait for the first, lists for the second, and each kept the other waiting.
+/// kept for making descriptors (`VICTORY_VIEW_THREADS`, scales up to 8/10 on
+/// high-core CPUs; 1: on this one alone). Those for `records`, the heaps'
+/// records copied as bytes, are others than those for the views picked by
+/// index: submissions wait for the first, lists for the second, and each
+/// kept the other waiting.
 pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
     POOLS[usize::from(records)]
         .get_or_init(|| {
-            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
+            let cpus = std::thread::available_parallelism().map_or(6, |n| n.get());
+            let default = if records { (cpus / 2).clamp(6, 10) } else { (cpus / 3).clamp(4, 8) };
+            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
             Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
         })
         .each(count, f);
