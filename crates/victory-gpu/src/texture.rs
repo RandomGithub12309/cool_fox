@@ -110,6 +110,8 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// Frame when this staging buffer was detiled ahead by `heap_worker`.
+    ahead: Option<u64>,
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -1339,6 +1341,34 @@ impl Staging {
             && self.footprints[0].Footprint.Format == DXGI_FORMAT_R8_UNORM
     }
 
+    /// Detiles texture memory into the staging buffer ahead of submission on
+    /// the `heap_worker` thread using non-blocking kernel reads and AES-NI
+    /// hashing. Returns `false` if unreadable (the submission handles it later).
+    pub(crate) fn refresh_ahead(&self) -> bool {
+        let size = self.read;
+        let start = self.memory as usize;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &mut *last;
+        if last.hash.is_some() || last.asked != 0 {
+            return true;
+        }
+        let asked = crate::watch::writes(start, start + size, false)
+            .or_else(|| crate::watch::writes(start, start + size, true));
+        let Some((now, _)) = asked else {
+            return false;
+        };
+        with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            last.hash = Some(digest(read));
+            self.detile(read);
+            last.asked = now;
+            last.ahead = Some(crate::frame::current());
+            true
+        })
+    }
+
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
         let whole = std::time::Instant::now();
@@ -1395,7 +1425,8 @@ impl Staging {
             let frame = crate::frame::current();
             let turn = frame
                 .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+                .is_multiple_of(HASH_EVERY)
+                && last.ahead.is_none_or(|at| frame > at + 1);
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.hot_until == 0 {

@@ -5220,11 +5220,24 @@ impl Host {
 
     /// [`Host::execute_late`] of parts of submissions in one: another begins
     /// at each place of `order` in `parts` ([`joins`]).
-    pub(crate) fn execute_parts(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+    pub(crate) fn execute_parts(&self, mut lists: Vec<crate::list::Detached>, mut order: Vec<usize>, parts: &[usize]) {
         if order.is_empty() {
             crate::list::recycle(lists, &order);
             return;
         }
+        // Prepend background texture upload lists prepared by `heap_worker`.
+        let ahead = crate::heap_worker::take_ready();
+        let shifted_parts: Vec<usize>;
+        let parts = if !ahead.is_empty() {
+            let n = ahead.len();
+            let first = lists.len();
+            order.splice(0..0, first..first + n);
+            lists.extend(ahead.into_iter().map(crate::list::Detached::ours));
+            shifted_parts = parts.iter().map(|&p| p + n).collect();
+            &shifted_parts
+        } else {
+            parts
+        };
         late_threads();
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
@@ -7396,6 +7409,20 @@ impl HostList {
         Some(source)
     }
 
+    /// Detiles and stages texture uploads queued on this list from a worker
+    /// thread ahead of submission; returns how many could not be staged yet.
+    pub(crate) fn refresh_textures_ahead(&self) -> u64 {
+        let mut left = 0u64;
+        for step in &self.deferred().copies {
+            if let Step::Texture(staging) = step
+                && !staging.refresh_ahead()
+            {
+                left += 1;
+            }
+        }
+        left
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
@@ -7509,6 +7536,10 @@ impl HostList {
                         batch.title_written();
                         // (It may write anywhere, a heap's records too.)
                         crate::port_journal::prep_wrote();
+                    } else if !batch.due.is_empty() {
+                        // Host callbacks can use a refresh result, including the
+                        // mip mask that maps a reserved texture for this upload.
+                        batch.refresh_textures();
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
@@ -7894,7 +7925,17 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
 
 /// Steps of a submission's lists from which [`Batch::refresh_front`] makes
 /// each list's part beside the submitting thread (renderer port #6).
-const WIDE_PLAN_STEPS: usize = 4096;
+/// Lowered on >= 12-core CPUs where our lock-free SpinPool dispatches in ~1 us.
+fn wide_plan_steps() -> usize {
+    static STEPS: OnceLock<usize> = OnceLock::new();
+    *STEPS.get_or_init(|| {
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() >= 12) {
+            512
+        } else {
+            4096
+        }
+    })
+}
 
 /// One list's part of [`front_spans`] (renderer port #6, [`list_front`]).
 #[derive(Default)]
@@ -8349,7 +8390,7 @@ impl Batch {
         // a frame has most of the frame's steps, 3-6 ms of this alone (run
         // guard-4).
         let steps: usize = runs.iter().map(|list| list.deferred().copies.len()).sum();
-        if crate::watch::port_guard_plan() && runs.len() >= 2 && steps >= WIDE_PLAN_STEPS {
+        if crate::watch::port_guard_plan() && runs.len() >= 2 && steps >= wide_plan_steps() {
             #[derive(Clone, Copy)]
             struct Lists(*const *const HostList, usize);
             // SAFETY: the lists outlive the call, which waits for every job.
@@ -9291,11 +9332,15 @@ impl Meter {
             }
             {
                 let mode = crate::watch::page_writes();
-                let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
+                let [writes, bytes, guarded, plain, told] = [0, 1, 2, 3, 4].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
                 let [kept, dropped, slots, uploaded] =
                     [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
+                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the \
+                     title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to \
+                     plain addresses finished ({}; {told} passed to the texture pass); {kept} ranges under texture views kept for the texture pass ({dropped} dropped); \
+                     {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({}) \
+                     (VICTORY_PAGE_WRITES: unset = guards and slots, plain reads' textures too; guards, 0 counts only, 1, slots, all)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
                     if mode & 4 != 0 { "told as well" } else { "counted only" },

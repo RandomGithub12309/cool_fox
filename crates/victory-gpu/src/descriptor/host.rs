@@ -1513,6 +1513,12 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
+thread_local! {
+    /// Set while [`HostHeap::publish`] mirrors an already-uploaded slot so it
+    /// is not re-enqueued into the indexed texture queue.
+    static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -2634,6 +2640,9 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        if PUBLISHING.get() {
+            return;
+        }
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -3393,6 +3402,21 @@ impl HostHeap {
             self.unmake_stale(index, stale);
         }
         Some(view)
+    }
+
+    /// Publishes host slot `index` from `handle` if its record key still
+    /// matches `key` (called when a background `heap_worker` upload list is
+    /// prepended to a submission).
+    pub(crate) fn publish(&self, index: u32, handle: u64, key: u64) -> bool {
+        // SAFETY: `handle` is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || u64::from(generation) << 32 | u64::from(i) != key {
+            return false;
+        }
+        PUBLISHING.set(true);
+        let shown = self.mirror(index, handle, true).is_some();
+        PUBLISHING.set(false);
+        shown
     }
 
     /// Whether slot `index` was made from no record: what [`HostHeap::mirror`]

@@ -232,7 +232,7 @@ static BAKE_UPLOAD: std::sync::Mutex<Option<BakeList>> = std::sync::Mutex::new(N
 /// Pending descriptor publications for a synchronous bake upload pass: slots
 /// stay on `neutral()` (or their previous compatible view) until the dedicated
 /// upload list has finished executing on the host GPU.
-struct BakeSync {
+pub(crate) struct BakeSync {
     publish: Vec<(u32, u64, u64)>,
     keep: Vec<std::sync::Arc<crate::resource::HostTexture>>,
 }
@@ -605,6 +605,13 @@ type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
+/// Where [`State::heap_textures`] records uploads: directly into the active
+/// recording list, or into a background batch owned by `heap_worker`.
+pub(crate) enum Into<'a> {
+    List(&'a HostList),
+    Ahead(&'a mut crate::heap_worker::Batch),
+}
+
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of the passes, nanoseconds since the last frame line: looking at slots,
@@ -2121,7 +2128,9 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let refreshed = std::time::Instant::now();
         stage.next("the heap pass: textures");
-        let _ = self.heap_textures(list, heap, host, None);
+        if !crate::heap_worker::kick(heap) {
+            let _ = Self::heap_textures(Into::List(list), heap, host, None);
+        }
         stage.end();
         #[cfg(feature = "diagnostics")]
         HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2366,9 +2375,10 @@ impl State {
                             "a draw of the title's decoration bake: textures picked by index are uploaded synchronously first (VICTORY_BAKE_TEXTURES_MS=0: not)"
                         );
                     }
+                    let _pass = crate::heap_worker::on().then(crate::heap_worker::urgent);
                     BAKE_SERVED.store(0, Ordering::Relaxed);
                     PASS_BUDGET.set(Some((left, 2 << 30, true)));
-                    served = self.heap_textures(bake_list, heap, host, Some(&mut sync));
+                    served = Self::heap_textures(Into::List(bake_list), heap, host, Some(&mut sync));
                     PASS_BUDGET.set(None);
                 }
                 crate::texture::BAKING.set(false);
@@ -2405,10 +2415,11 @@ impl State {
                     return;
                 }
             }
+            let _pass = crate::heap_worker::on().then(crate::heap_worker::urgent);
             EARLY_TEXTURE_PASSES[1].fetch_add(1, Ordering::Relaxed);
             PASS_BUDGET.set(Some((left, 2 << 30, true)));
             crate::texture::BAKING.set(exact);
-            let _ = self.heap_textures(list, heap, host, None);
+            let _ = Self::heap_textures(Into::List(list), heap, host, None);
             crate::texture::BAKING.set(false);
             PASS_BUDGET.set(None);
             BAKED_MS.fetch_add(began.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -2419,9 +2430,12 @@ impl State {
         } else {
             return;
         };
+        if crate::heap_worker::kick(heap) {
+            return;
+        }
         EARLY_TEXTURE_PASSES[0].fetch_add(1, Ordering::Relaxed);
         PASS_BUDGET.set(Some((budget.0, budget.1, false)));
-        let _ = self.heap_textures(list, heap, host, None);
+        let _ = Self::heap_textures(Into::List(list), heap, host, None);
         PASS_BUDGET.set(None);
     }
 
@@ -2514,9 +2528,8 @@ impl State {
     /// in place of others, and contents changed with no descriptor write,
     /// are missed (hook the page-mapping events for those).
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
-    fn heap_textures(
-        &self,
-        list: &HostList,
+    pub(crate) fn heap_textures(
+        mut into: Into<'_>,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
         mut sync: Option<&mut BakeSync>,
@@ -2623,6 +2636,7 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
+        let took = if matches!(into, Into::Ahead(_)) { took.max(100) } else { took };
         let most = (4000 / took).clamp(16, 256);
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
@@ -2682,6 +2696,24 @@ impl State {
                 served = false;
                 break;
             }
+            let ahead_worker = matches!(into, Into::Ahead(_));
+            if ahead_worker && crate::heap_worker::make_way() {
+                served = false;
+                break;
+            }
+            // Pin texture objects when running on the background worker thread.
+            let record = heap.handle(index).and_then(crate::descriptor::view_and_key);
+            let _held = match &record {
+                Some((View::Shader(object, _), _)) if ahead_worker => {
+                    let held = crate::resource::hold(*object as This);
+                    if held.is_none() {
+                        host.texture_slot_done(index, write, None);
+                        continue;
+                    }
+                    held
+                }
+                _ => None,
+            };
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
             // of such views) gets no host texture; looked at again soon (a
@@ -2849,6 +2881,8 @@ impl State {
                     Some((view, key)) => (Some(view), Some(key)),
                     None => (None, None),
                 }
+            } else if ahead_worker {
+                (record.as_ref().map(|(v, _)| v.clone()), None)
             } else {
                 let view = heap.handle(index).and_then(|handle| {
                     if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
@@ -2908,8 +2942,21 @@ impl State {
                     }
                     // Its bytes are in, or on the way there in a list before.
                     if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
-                        if let Some(handle) = heap.handle(index) {
-                            host.texture_slot_show_after(list, index, handle);
+                        match &mut into {
+                            Into::List(list) => {
+                                if let Some(handle) = heap.handle(index) {
+                                    host.texture_slot_show_after(list, index, handle);
+                                }
+                            }
+                            Into::Ahead(batch) => {
+                                if let (Some(handle), Some((_, key))) = (heap.handle(index), &record) {
+                                    batch.publish(index, handle, *key);
+                                }
+                            }
+                        }
+                    } else if ahead_worker {
+                        if let (Some(handle), Some((_, key))) = (heap.handle(index), &record) {
+                            let _ = host.publish(index, handle, *key);
                         }
                     } else {
                         at_once();
@@ -2955,7 +3002,19 @@ impl State {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
-                readable(list, sampled.kind, view);
+                match &mut into {
+                    Into::List(list) => readable(list, sampled.kind, view),
+                    Into::Ahead(batch) => {
+                        let Some(list) = batch.list() else {
+                            crate::texture::PICKING.set(None);
+                            return false;
+                        };
+                        readable(list, sampled.kind, view);
+                        if let (Some(handle), Some((_, key))) = (heap.handle(index), &record) {
+                            batch.publish(index, handle, *key);
+                        }
+                    }
+                }
                 crate::texture::PICKING.set(None);
             }
             // A failed or deferred staging allocation leaves this slot due.
@@ -2973,28 +3032,30 @@ impl State {
                 }
                 sync.publish.push((index, handle, key));
             }
-            if shows_other && let Some(handle) = heap.handle(index) {
-                host.texture_slot_flip(list, index, handle);
-            }
-            if late && let Some(handle) = heap.handle(index) {
-                host.texture_slot_show_after(list, index, handle);
-            }
-            #[cfg(feature = "diagnostics")]
-            if crate::book::on()
-                && let Some(texture) = texture.filter(|t| crate::pool::fresh(t))
-            {
-                use windows::core::Interface;
-                let raw = texture.as_raw() as usize;
-                let asked = crate::host::submissions();
-                list.defer_host(move || {
-                    let (started, finished) = crate::host::submissions();
-                    crate::book::note(raw, || {
-                        format!(
-                            "; upload for slot {index} recorded at submissions {asked:?}, sent as submission {started} (finished {finished}) at {:.3} s",
-                            crate::host::now_ms() as f64 / 1e3
-                        )
+            if let Into::List(list) = &into {
+                if shows_other && let Some(handle) = heap.handle(index) {
+                    host.texture_slot_flip(list, index, handle);
+                }
+                if late && let Some(handle) = heap.handle(index) {
+                    host.texture_slot_show_after(list, index, handle);
+                }
+                #[cfg(feature = "diagnostics")]
+                if crate::book::on()
+                    && let Some(texture) = texture.filter(|t| crate::pool::fresh(t))
+                {
+                    use windows::core::Interface;
+                    let raw = texture.as_raw() as usize;
+                    let asked = crate::host::submissions();
+                    list.defer_host(move || {
+                        let (started, finished) = crate::host::submissions();
+                        crate::book::note(raw, || {
+                            format!(
+                                "; upload for slot {index} recorded at submissions {asked:?}, sent as submission {started} (finished {finished}) at {:.3} s",
+                                crate::host::now_ms() as f64 / 1e3
+                            )
+                        });
                     });
-                });
+                }
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3040,6 +3101,9 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            if let Into::Ahead(batch) = &mut into {
+                batch.uploaded(bytes);
+            }
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
@@ -4710,7 +4774,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0
