@@ -76,6 +76,13 @@ if not defined VICTORY_PORT_JOURNAL set "VICTORY_PORT_JOURNAL=1"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
+rem Eliminate 200+ ms pipeline-library save hitches and keep 16 GB RAM / 8 GB VRAM
+rem headroom steady during long sessions without affecting visual quality.
+if not defined VICTORY_LIBRARY_STORE_LATER set "VICTORY_LIBRARY_STORE_LATER=1"
+if not defined VICTORY_LIST_IDLE_TRIM_S set "VICTORY_LIST_IDLE_TRIM_S=15"
+if not defined VICTORY_STAGING_IDLE_MS set "VICTORY_STAGING_IDLE_MS=15000"
+if not defined VICTORY_WINDOW_IDLE_MS set "VICTORY_WINDOW_IDLE_MS=15000"
+if not defined VICTORY_READ_KEEP_MB set "VICTORY_READ_KEEP_MB=8"
 rem Series S default: force Rockstar's own temporal upscaler (VICTORY_UPSCALER=6)
 rem instead of AMD FidelityFX FSR (7), which fails Wave32 translation on NVIDIA,
 rem smears postprocessing like a watercolor painting, and crashes before gameplay.
