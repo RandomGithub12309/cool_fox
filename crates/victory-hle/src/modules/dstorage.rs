@@ -639,16 +639,31 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let e_cores = victory_gpu::efficiency_core_count();
+        let default_workers = if e_cores >= 8 {
+            // Keep DirectStorage NVMe + BCPack/zlib decompression saturating
+            // the efficiency cores without preempting P-core render threads.
+            e_cores.clamp(4, 12)
+        } else {
+            std::thread::available_parallelism().map_or(4, |n| n.get())
+        };
+        let workers = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(default_workers)
+            .clamp(1, 32);
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(|| {
+                        victory_gpu::keep_on_efficiency_cores("dstorage");
+                        work(scheduler);
+                    })
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, e_cores, "dstorage: workers");
     });
     Some(scheduler)
 }

@@ -68,9 +68,21 @@ RWByteAddressBuffer card : register(u0);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= count) return;
-    uint2 p = pairs.Load2(at + id.x * 8u);
-    card.Store(p.x, p.y);
+    uint i = id.x * 4u;
+    if (i >= count) return;
+    if (i + 4u <= count) {
+        uint4 a = pairs.Load4(at + i * 8u);
+        uint4 b = pairs.Load4(at + i * 8u + 16u);
+        card.Store(a.x, a.y);
+        card.Store(a.z, a.w);
+        card.Store(b.x, b.y);
+        card.Store(b.z, b.w);
+    } else {
+        for (uint k = i; k < count; k++) {
+            uint2 p = pairs.Load2(at + k * 8u);
+            card.Store(p.x, p.y);
+        }
+    }
 }
 "#;
 
@@ -342,14 +354,14 @@ impl Own {
                 list.SetComputeRootShaderResourceView(1, self.memory.buffer.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
-                    const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+                    const MOST: u32 = 256 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
                     let (at, words) = copy.pairs;
                     let mut done = 0;
                     while done < words {
                         let n = (words - done).min(MOST);
                         let constants = [at as u32 + done * 8, n];
                         list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
-                        list.Dispatch(n.div_ceil(64), 1, 1);
+                        list.Dispatch(n.div_ceil(256), 1, 1);
                         done += n;
                     }
                 }

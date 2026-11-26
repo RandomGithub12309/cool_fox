@@ -1070,6 +1070,15 @@ pub(crate) fn ready(
     })
 }
 
+/// Drops a released view heap's title-memory run so a heap later allocated at
+/// the same address never reuses stale entries (fork PR #589).
+pub(crate) fn forget_heap(heap: &HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.heaps.remove(&key);
+    }
+}
+
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of
 /// one thread that stores a structure's compacted size) and when title memory
 /// has them, and the copies to a place of that size.

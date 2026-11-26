@@ -38,6 +38,55 @@ fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
     if fast.len() == sets.len() { Vec::new() } else { fast }
 }
 
+/// The sets below the fastest class (efficiency cores on hybrid CPUs).
+fn slow_of(sets: &[(u32, u8)]) -> Vec<u32> {
+    let best = sets.iter().map(|c| c.1).max().unwrap_or(0);
+    let slow: Vec<u32> = sets.iter().filter(|c| c.1 < best).map(|c| c.0).collect();
+    if slow.len() == sets.len() { Vec::new() } else { slow }
+}
+
+fn cached_slow_sets() -> &'static (Vec<u32>, usize) {
+    static SLOW: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
+    SLOW.get_or_init(|| {
+        let sets = cpu_sets();
+        (slow_of(&sets), sets.len())
+    })
+}
+
+/// Number of efficiency cores on a hybrid CPU (0 on homogeneous CPUs).
+pub fn efficiency_core_count() -> usize {
+    cached_slow_sets().0.len()
+}
+
+/// Routes a background streaming/decompression/detile thread onto efficiency
+/// cores on hybrid CPUs with many E-cores (8+ E-cores, e.g. Arrow Lake
+/// 8P+12E) and lowers its scheduling priority so it never preempts the
+/// title's render/recording threads or latency-critical P-core threads.
+pub fn keep_on_efficiency_cores(what: &str) {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, SetThreadSelectedCpuSets, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+    if stage() == 0 {
+        return;
+    }
+    // SAFETY: lowers priority of the calling background worker thread only.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+    let (slow, of) = cached_slow_sets();
+    if slow.len() < 8 {
+        return;
+    }
+    // SAFETY: our own thread and a list of the system's own CPU set IDs.
+    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) };
+    if ok == 0 {
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "background worker could not be kept on efficiency cores");
+    } else {
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            tracing::info!(what, slow = slow.len(), of, "background worker routed to efficiency cores (VICTORY_FAST_CORES=0: not)");
+        }
+    }
+}
+
 /// Default `VICTORY_FAST_CORES` stage for a CPU topology.
 ///
 /// On hybrid CPUs with many efficiency cores (8+ E-cores, e.g. Arrow Lake

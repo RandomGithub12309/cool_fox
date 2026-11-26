@@ -738,7 +738,9 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
-    if bytes > 4 << 20 {
+    // Parallelize medium-to-large Write-Combining upload transfers across our
+    // low-latency spin pool so multiple cores saturate WC store buffers.
+    if bytes > 512 << 10 {
         wide(copy_jobs(copies));
         return;
     }
@@ -4052,8 +4054,8 @@ impl Shadow {
     /// they are long: the big heap's copy has some 4 MB of them in each of
     /// 14 refreshes a frame, on one thread while the others had nothing.
     fn take_all(&self, runs: Vec<(usize, usize, bool)>) -> usize {
-        const LONG: usize = 1 << 20;
-        const PART: usize = 256 << 10;
+        const LONG: usize = 512 << 10;
+        const PART: usize = 128 << 10;
         let bytes = runs.iter().map(|r| r.1 - r.0).sum();
         if bytes < LONG || !crate::watch::light() {
             for (from, to, known) in runs {

@@ -28,6 +28,8 @@ mod copystat;
 mod faultbook;
 #[cfg(windows)]
 mod cores;
+#[cfg(windows)]
+pub use cores::{efficiency_core_count, keep_on_efficiency_cores};
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]

@@ -237,6 +237,7 @@ impl Worker {
     }
 
     fn work(self) {
+        crate::cores::keep_on_efficiency_cores("victory-upload-ahead");
         let mut value = 0;
         loop {
             let mut jobs = Vec::new();
