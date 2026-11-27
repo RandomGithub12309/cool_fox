@@ -66,13 +66,24 @@ if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 if not defined VICTORY_WIDE_SPIN set "VICTORY_WIDE_SPIN=50"
 if not defined VICTORY_D3D12_BACKGROUND set "VICTORY_D3D12_BACKGROUND=0"
-rem Renderer Ports 1, 5, 6, 7 (zero-copy 32-bit graphics heap, zero-copy root
-rem CBVs, shared-lock/per-block write guards + parallel planning, partitioned
-rem journal tracking & early descriptor sync).
+rem Renderer Ports 1, 2, 5, 6, 7 (zero-copy 32-bit graphics heap, patched
+rem descriptor-store slot tracking, zero-copy root CBVs, shared-lock/per-block
+rem write guards + parallel planning, partitioned journal & early sync).
 if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=1"
+if not defined VICTORY_PORT_DESCRIPTORS set "VICTORY_PORT_DESCRIPTORS=1"
 if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=1"
 if not defined VICTORY_PORT_GUARD set "VICTORY_PORT_GUARD=1"
 if not defined VICTORY_PORT_JOURNAL set "VICTORY_PORT_JOURNAL=1"
+rem GPU/CPU throughput engines adapted for RTX 5050 8 GB + Arrow Lake:
+rem batch consecutive D3D12 barriers, overlap buffer uploads on high-priority
+rem COPY queue (auto-capped at 128 MiB bounce VRAM on <=10 GiB GPUs), fuse
+rem AVX2 under-write compare+copy, and hold newly allocated textures until
+rem prior submissions finish (prevents NVIDIA GPU page faults).
+if not defined VICTORY_JOIN_BARRIERS set "VICTORY_JOIN_BARRIERS=1"
+if not defined VICTORY_UP_QUEUE set "VICTORY_UP_QUEUE=1"
+if not defined VICTORY_UNDER_FUSED set "VICTORY_UNDER_FUSED=1"
+if not defined VICTORY_SHOW_NEW_LATER set "VICTORY_SHOW_NEW_LATER=1"
+if not defined VICTORY_AMBIENT_SETTLE set "VICTORY_AMBIENT_SETTLE=250,3"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
