@@ -4010,12 +4010,29 @@ impl Shadow {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
+            // gaps whole cost ~1 s per frame). Under them, merge title writes
+            // (upstream PR #1322: prevents stale zero counts/constants on
+            // NVIDIA RTX 4050/5050 Laptop when an earlier list in the same
+            // submission declared a range as shader-written).
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
+                let (a, e) = (a.max(from), e.min(to));
                 if a > at {
                     bytes += self.update_free(at, a);
+                }
+                let lo = a.max(at);
+                if e > lo {
+                    if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+                        let has_ref = self.card.is_some()
+                            || self.before.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                        if has_ref {
+                            let mut runs_left = 4096;
+                            let _ = self.merge_under_writes(lo, e - lo, &mut runs_left);
+                        } else {
+                            bytes += self.update_free(lo, e);
+                        }
+                    }
                 }
                 at = at.max(e);
             }

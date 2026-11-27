@@ -117,12 +117,11 @@ fn idle_without_rays(container: &[u8]) -> bool {
 }
 
 /// Whether a container's program is one of those that animate and draw hair
-/// strands, by its name. `VICTORY_HAIR` has them run.
-/// shortcut: left out, as some of them do not translate (an address from a
-/// phi) and the others draw lines all over the screen without them.
+/// strands, by its name. Runs by default (matching DexNom and Belobug); set
+/// `VICTORY_HAIR=0` to skip hair strand passes.
 #[cfg(windows)]
 fn hair_strands(container: &[u8]) -> bool {
-    static RUN: OnceLock<bool> = OnceLock::new();
+    static SKIP: OnceLock<bool> = OnceLock::new();
     const NAMES: [&[u8]; 18] = [
         b"InterpolateStrand",
         b"HairStrand",
@@ -143,7 +142,7 @@ fn hair_strands(container: &[u8]) -> bool {
         b"CS_CullMaskPass",
         b"CS_LodBlend",
     ];
-    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some()) {
+    if !*SKIP.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some_and(|v| v == "0")) {
         return false;
     }
     const END: &[u8] = b"_Wrapped";

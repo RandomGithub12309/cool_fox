@@ -948,7 +948,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             once!("no upload buffer for a CPU-written movie plane");
             return;
         };
-        record_upload(list, resource, texture, &staging, &source, 0);
+        record_upload(list, resource, texture, copy.pooled, &staging, &source, 0);
         staging.uploaded.store(true, Relaxed);
         return;
     }
@@ -1109,6 +1109,7 @@ fn record_upload(
     list: &HostList,
     resource: This,
     texture: &ID3D12Resource,
+    pooled: bool,
     staging: &Staging,
     source: &ID3D12Resource,
     base: u64,
@@ -1117,7 +1118,9 @@ fn record_upload(
     const COPY_DEST: u32 = 0x400;
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
-    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
+    // Only placed textures allocated from `crate::pool` may receive an
+    // aliasing barrier; committed/reserved textures must never get one.
+    if pooled && !staging.uploaded.load(Relaxed) {
         let aliasing = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -1194,7 +1197,7 @@ fn fill_plane(
     bytes: usize,
     pitch: usize,
 ) {
-    let _pin = crate::watch::title_memory_reading();
+    let _pin = crate::watch::title_memory_reading_range(at..at.saturating_add(len));
     // SAFETY: the list owns this full upload allocation until its GPU work completes.
     let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
     let mip = &layout.mips[0];
@@ -1515,6 +1518,7 @@ impl Staging {
     fn refresh_timed(&self) -> usize {
         let size = self.read;
         let start = self.memory as usize;
+        let Some(end) = start.checked_add(size) else { return 0 };
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         let exact = self.exact.swap(false, std::sync::atomic::Ordering::Relaxed);
@@ -1522,7 +1526,7 @@ impl Staging {
         if alone && !exact && last.hash.is_some() {
             return 0;
         }
-        if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, end, false)) {
             if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1552,7 +1556,7 @@ impl Staging {
         let mut blind = false;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = waited(1, || crate::watch::writes(start, end, true))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
@@ -1581,22 +1585,21 @@ impl Staging {
                 crate::copystat::add(crate::copystat::C::TexHot, 1);
             }
         };
-        // From here on the texture's memory may be read in place. Held until
-        // that read is done: the runtime changes what title memory shows
-        // only with this taken alone, so what `committed` finds mapped
-        // stays mapped (see `crate::watch::title_memory_reading`; without
-        // it a page went between the asking and the read in runs 71 and
-        // 74).
+        // Pin only this texture's exact virtual address range through the
+        // committed check, hash, and detile (DexNom 5f4c3df). Windows
+        // temporarily removes whole physical views on a partial remap; xmem
+        // includes those old extents in its writer range, while disjoint
+        // streaming remaps proceed without stalling this texture refresh.
         let _mapped = if no_wait() && !exact {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
+            // Not waited for: while the runtime remaps overlapping title memory
+            // the texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_now_range(start..end) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_range(start..end))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages

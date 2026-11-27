@@ -572,6 +572,37 @@ struct Physical {
 }
 
 impl Physical {
+    /// Windows unmaps every intersected view in full, even when unmapping
+    /// one page in its middle. Caller holds PHYSICAL until remapping ends.
+    fn unmap_extent(&self, base: usize, end: usize) -> std::ops::Range<usize> {
+        let start = self
+            .views
+            .range(..=base)
+            .next_back()
+            .filter(|(at, (size, _))| *at + size > base)
+            .map_or(base, |(&at, _)| at);
+        let end = self
+            .views
+            .range(..end)
+            .next_back()
+            .map_or(end, |(&at, (size, _))| end.max(at + size));
+        start..end
+    }
+
+    /// Bounding extent covering every address and intersecting view that `ops`
+    /// can temporarily unmap.
+    fn ops_extent(&self, ops: &[Op]) -> std::ops::Range<usize> {
+        let mut range: Option<std::ops::Range<usize>> = None;
+        for op in ops {
+            let ext = self.unmap_extent(op.at, op.at.saturating_add(op.len));
+            range = Some(match range {
+                Some(r) => r.start.min(ext.start)..r.end.max(ext.end),
+                None => ext,
+            });
+        }
+        range.unwrap_or(0..0)
+    }
+
     /// What the page at `at` shows.
     fn slice_at(&self, at: usize) -> Option<Slice> {
         self.views
@@ -1239,6 +1270,15 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    if n == 0 {
+        return address;
+    }
+    let Some(len) = n.checked_mul(PAGE) else {
+        return std::ptr::null_mut();
+    };
+    let Some(end) = base.checked_add(len) else {
+        return std::ptr::null_mut();
+    };
     // Read before any lock is taken: a fault in title memory may wait for
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
@@ -1258,9 +1298,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
-    // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    // into that gap (`victory_gpu::title_memory_remapping_range`).
+    let _changing = victory_gpu::title_memory_remapping_range(physical.unmap_extent(base, end));
+    unmap(&mut physical, base, len);
     let Some(pages) = pages else {
         return address;
     };
@@ -1339,13 +1379,23 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    if len == 0 {
+        return true;
+    }
+    let span = if from == 0 { Some(len) } else { len.checked_next_multiple_of(PAGE) };
+    let Some(end) = span.and_then(|s| to.checked_add(s)) else {
+        return false;
+    };
+    if from.checked_add(len).is_none() {
+        return false;
+    }
     let _costed = Costed::begin(None);
     let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping_range(physical.unmap_extent(to, end));
     unmap(&mut physical, to, len);
-    if from == 0 || len == 0 {
+    if from == 0 {
         return true;
     }
     let pages = len / PAGE;
@@ -1421,7 +1471,7 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             ops.push(Op::new(to, slice.flatten()));
             at += 1;
         }
-        let _changing = victory_gpu::title_memory_remapping();
+        let _changing = victory_gpu::title_memory_remapping_range(physical.ops_extent(&ops));
         ok &= change(&mut physical, ops);
     }
     ok
@@ -1459,7 +1509,7 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
         if let Some(costed) = &mut costed {
             costed.pages = Some(ops.len());
         }
-        let _changing = victory_gpu::title_memory_remapping();
+        let _changing = victory_gpu::title_memory_remapping_range(physical.ops_extent(&ops));
         ok &= change(&mut physical, ops);
     }
     ok

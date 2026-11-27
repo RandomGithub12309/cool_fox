@@ -66,9 +66,18 @@ impl Rec {
             return;
         }
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        // A resource whose state changes again: what is held goes first, so
-        // that no call holds two changes of one resource.
-        if barriers.iter().filter_map(named).any(|r| held.0.iter().filter_map(named).any(|h| h == r)) {
+        // Flush before a UAV barrier (or if a UAV barrier is already held), or
+        // if a resource's state changes again, so no call holds two changes of
+        // one resource or reorders UAV synchronization across transitions.
+        let is_uav = |b: &D3D12_RESOURCE_BARRIER| b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        let conflicts = !held.0.is_empty()
+            && (barriers.iter().any(is_uav)
+                || held.0.iter().any(is_uav)
+                || barriers
+                    .iter()
+                    .filter_map(named)
+                    .any(|r| held.0.iter().filter_map(named).any(|h| h == r)));
+        if conflicts {
             // SAFETY: as in `flush`.
             unsafe { self.list.ResourceBarrier(&held.0) };
             held.0.clear();
@@ -79,6 +88,20 @@ impl Rec {
         held.0.extend(barriers.iter().map(|b| unsafe { std::ptr::read(b) }));
         STATS[0].fetch_add(1, Relaxed);
         self.any.store(true, Relaxed);
+    }
+
+    /// Resets the underlying command list after discarding any unflushed held
+    /// barriers without recording them onto a stale/closed list.
+    ///
+    /// # Safety
+    /// As `ID3D12GraphicsCommandList::Reset`: the list is not executing.
+    pub(crate) unsafe fn reset(&self, allocator: &ID3D12CommandAllocator) -> windows::core::Result<()> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.0.clear();
+        self.any.store(false, Relaxed);
+        drop(held);
+        // SAFETY: the caller's.
+        unsafe { self.list.Reset(allocator, None) }
     }
 
     /// What is held goes to the list, in one call.

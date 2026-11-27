@@ -346,13 +346,17 @@ impl Own {
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
         let (mut first, mut last) = (Vec::new(), Vec::new());
+        let mut any_runs = false;
+        let mut any_pairs = false;
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
+                any_runs = true;
                 // SAFETY: the caller's; live buffers, ranges inside them.
                 unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
             if copy.pairs.1 > 0 {
+                any_pairs = true;
                 if let Some(was) = state {
                     first.push(transition(&shadow.buffer, was, write));
                 }
@@ -365,6 +369,12 @@ impl Own {
             {
                 last.push(transition(&shadow.buffer, was, read));
             }
+        }
+        // When `source` is a DEFAULT-heap bounce buffer from `upq`, `CopyBufferRegion`
+        // implicitly promoted it from COMMON -> COPY_SOURCE. D3D12 requires an explicit
+        // transition to NON_PIXEL_SHADER_RESOURCE before binding it as a compute SRV.
+        if from.is_some() && any_runs && any_pairs {
+            first.push(transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, read));
         }
         // SAFETY: the caller's; live objects.
         unsafe {

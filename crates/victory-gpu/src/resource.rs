@@ -1202,6 +1202,10 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    /// True only when allocated as a placed texture from `crate::pool`
+    /// (requires a D3D12 aliasing barrier before its first upload; committed
+    /// and reserved textures must never receive an aliasing barrier).
+    pub(crate) pooled: bool,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -1636,7 +1640,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true).ok() } else { None };
+            let reserved = if partly {
+                host_texture_as(&r.desc, r.host.state, clear, true).ok().map(|(t, _)| t)
+            } else {
+                None
+            };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1660,11 +1668,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         let texture = match texture {
-            Some(texture) => Ok(texture),
+            Some(texture) => Ok((texture, false)),
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
-        let texture = match texture {
-            Ok(texture) => texture,
+        let (texture, pooled) = match texture {
+            Ok(pair) => pair,
             Err(NoTexture::Refused) => {
                 r.host.refused.store(true, Relaxed);
                 return None;
@@ -1697,6 +1705,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),
         };
+        host.pooled = pooled;
         host.base = base;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
@@ -2425,6 +2434,7 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            pooled: false,
         }
     }
 
@@ -2450,6 +2460,7 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            pooled: false,
         }
     }
 }
@@ -2562,7 +2573,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+) -> Result<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, bool), NoTexture> {
     host_texture_as(desc, state, clear, false)
 }
 
@@ -2574,7 +2585,7 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+) -> Result<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, bool), NoTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2651,7 +2662,7 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
-        return Ok(t);
+        return Ok((t, true));
     }
     let mut texture: Option<ID3D12Resource> = None;
     let made = if reserved {
@@ -2708,7 +2719,7 @@ fn host_texture_as(
     crate::host::name(&texture, || {
         format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
     });
-    Ok(texture)
+    Ok((texture, false))
 }
 
 /// The host copy of title texture `this` if it is made and was made

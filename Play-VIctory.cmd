@@ -66,11 +66,16 @@ if not defined VICTORY_THIN set "VICTORY_THIN=0"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=0"
 if not defined VICTORY_WIDE_SPIN set "VICTORY_WIDE_SPIN=50"
 if not defined VICTORY_D3D12_BACKGROUND set "VICTORY_D3D12_BACKGROUND=0"
-rem Renderer Ports 1, 2, 5, 6, 7 (zero-copy 32-bit graphics heap, patched
-rem descriptor-store slot tracking, zero-copy root CBVs, shared-lock/per-block
-rem write guards + parallel planning, partitioned journal & early sync).
+rem Hair strand shaders run by default (DexNom/Belobug accuracy); set VICTORY_HAIR=0
+rem only if you want to skip strand shaders for troubleshooting.
+if not defined VICTORY_HAIR set "VICTORY_HAIR=1"
+rem Renderer Ports 1, 5, 6, 7 (zero-copy 32-bit graphics heap, zero-copy root
+rem CBVs, shared-lock/per-block write guards + parallel planning, partitioned
+rem journal & early sync). Port 2 (VICTORY_PORT_DESCRIPTORS) stays opt-in (=0)
+rem matching Belobug: unhooked cutscene/streaming descriptor writes can leave
+rem stale descriptors and trigger NVIDIA DXGI_ERROR_DEVICE_RESET (0x887A0007).
 if not defined VICTORY_PORT_CONSTANTS set "VICTORY_PORT_CONSTANTS=1"
-if not defined VICTORY_PORT_DESCRIPTORS set "VICTORY_PORT_DESCRIPTORS=1"
+if not defined VICTORY_PORT_DESCRIPTORS set "VICTORY_PORT_DESCRIPTORS=0"
 if not defined VICTORY_PORT_CBV set "VICTORY_PORT_CBV=1"
 if not defined VICTORY_PORT_GUARD set "VICTORY_PORT_GUARD=1"
 if not defined VICTORY_PORT_JOURNAL set "VICTORY_PORT_JOURNAL=1"

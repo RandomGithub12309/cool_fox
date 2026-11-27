@@ -6779,7 +6779,7 @@ impl HostList {
         let reset = unsafe {
             self.allocator
                 .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+                .and_then(|()| self.list.reset(&self.allocator))
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
@@ -7098,8 +7098,12 @@ impl HostList {
         // A copy runs with its textures in the copy states: each moves
         // there from its real state, and from there to the state the list
         // starts with (back to its real state if the list does not use it).
+        // Keep `sync_to_copy` and `upload_to_copy` separate so a texture
+        // present in both `syncs` and `uploads` never emits two transitions
+        // in a single ResourceBarrier call (NVIDIA strict D3D12 validation).
         let mut aliasing = Vec::new();
-        let mut to_copy = Vec::new();
+        let mut sync_to_copy = Vec::new();
+        let mut upload_to_copy = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
         for (depth, twin, colour) in &syncs {
@@ -7113,7 +7117,7 @@ impl HostList {
                 let real = texture.state.load(Ordering::Relaxed);
                 copying.insert(key, state);
                 if real != state {
-                    to_copy.push(transition(
+                    sync_to_copy.push(transition(
                         &texture.texture,
                         host_state(real),
                         host_state(state),
@@ -7131,9 +7135,9 @@ impl HostList {
         for (upload, first_upload) in uploads {
             let copy = &upload.copy;
             let key = std::sync::Arc::as_ptr(copy) as usize;
-            // A texture cut from a block may lie where another did: what the card
-            // holds of that one is done with before the first upload into this one.
-            if crate::pool::on() && *first_upload {
+            // Only placed textures cut from `crate::pool` may take an aliasing
+            // barrier; emitting one on a committed resource is invalid in D3D12.
+            if copy.pooled && *first_upload {
                 aliasing.push(D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -7148,17 +7152,24 @@ impl HostList {
             }
             let real = copying.get(&key).copied().unwrap_or_else(|| copy.state.load(Ordering::Relaxed));
             if real != COPY_DEST {
-                to_copy.push(transition(
+                upload_to_copy.push(transition(
                     &copy.texture,
                     host_state(real),
                     host_state(COPY_DEST),
                 ));
                 copying.insert(key, COPY_DEST);
                 if !states.contains_key(&key) {
+                    // Replace any prior return-to-real barrier from `syncs` so
+                    // `barriers` never transitions the same resource twice.
+                    let raw = copy.texture.as_raw();
+                    barriers.retain(|b| {
+                        b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION
+                            || unsafe { b.Anonymous.Transition.pResource.as_ref().map(|r| r.as_raw()) } != Some(raw)
+                    });
                     barriers.push(transition(
                         &copy.texture,
                         host_state(COPY_DEST),
-                        host_state(real),
+                        host_state(copy.state.load(Ordering::Relaxed)),
                     ));
                 }
             } else {
@@ -7186,14 +7197,17 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                if !aliasing.is_empty() {
-                    list.ResourceBarrier(&aliasing);
-                }
-                if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
+                if !sync_to_copy.is_empty() {
+                    list.ResourceBarrier(&sync_to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                if !aliasing.is_empty() {
+                    list.ResourceBarrier(&aliasing);
+                }
+                if !upload_to_copy.is_empty() {
+                    list.ResourceBarrier(&upload_to_copy);
                 }
                 for (upload, _) in uploads {
                     upload.record(self, list);
@@ -10542,6 +10556,59 @@ impl Host {
             Ok(()) => buffer,
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
+                None
+            }
+        }
+    }
+
+    /// A device-local copy/SRV bounce buffer (`D3D12_RESOURCE_FLAG_NONE`),
+    /// starting in the common state (used by `upq` without UAV metadata overhead).
+    pub(crate) fn copy_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        MADE[4].fetch_add(1, Ordering::Relaxed);
+        MADE[5].fetch_add(size, Ordering::Relaxed);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_NONE,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a device-local buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                not_resident(),
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::book::made(b, || "a copy bounce buffer".into());
+        }
+        let made = made
+            .and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b)))
+            .and_then(|()| mapped(&self.device));
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no copy bounce buffer");
                 None
             }
         }
