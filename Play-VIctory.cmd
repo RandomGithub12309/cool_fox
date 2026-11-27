@@ -103,12 +103,13 @@ rem Series S default: force Rockstar's own temporal upscaler (VICTORY_UPSCALER=6
 rem instead of AMD FidelityFX FSR (7), which fails Wave32 translation on NVIDIA,
 rem smears postprocessing like a watercolor painting, and crashes before gameplay.
 rem Output stays native 1920x1080 (2/3 internal = 1280x720, retail Series S).
-rem Redirect up to 1024 MiB of loose title windows into Resizable BAR GDDR7
-rem (capped automatically at 80%% VRAM) to prevent 16 GB RAM shared-memory OOM.
+rem Redirect up to 256 MiB of loose title windows into Resizable BAR GDDR7
+rem (leaving ~6.9 GiB of the 7.14 GiB DXGI VRAM budget free for Series S render
+rem targets, card buffers, and streamed textures without WDDM eviction thrash).
 if /i "%console_profile%"=="series-s" (
   if not defined VICTORY_OUTPUT set "VICTORY_OUTPUT=1920x1080"
   if not defined VICTORY_UPSCALER set "VICTORY_UPSCALER=6"
-  if not defined VICTORY_WINDOWS_BAR_MB set "VICTORY_WINDOWS_BAR_MB=1024"
+  if not defined VICTORY_WINDOWS_BAR_MB set "VICTORY_WINDOWS_BAR_MB=256"
 )
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 rem Controls: WASD (LAlt=walk), IJKL/Numpad (or F4 for Mouse Look + LMB/RMB),

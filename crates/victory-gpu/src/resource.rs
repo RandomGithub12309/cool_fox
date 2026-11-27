@@ -1791,8 +1791,16 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
+        // used. Never admit new textures when real local VRAM is already at
+        // >= 94% of DXGI budget or shared GPU memory is >= 82% of budget
+        // (prevents WDDM VRAM thrashing & 0x887A0007 TDR on 8 GB GPUs).
+        Some([budget, used, shared_budget, shared_used]) => {
+            if budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 94 {
+                return false;
+            }
+            if shared_budget > 0 && u128::from(shared_used) * 100 >= u128::from(shared_budget) * 82 {
+                return false;
+            }
             used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
                 < budget / 100 * room_percent()
         }
@@ -1801,14 +1809,21 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 }
 
 /// VRAM admission check for one-shot character decoration/skin bakes: checks
-/// real local VRAM usage instead of subtracting speculative future target or
-/// buffer reservations, preventing 8 GB GPUs (especially in Series S mode)
-/// from starving character head/skin textures during the one-shot bake pass.
+/// real local VRAM and shared GPU memory usage instead of subtracting
+/// speculative future target reservations, while still enforcing a hard
+/// physical ceiling (96% local VRAM, 88% shared GPU memory) so bakes never
+/// push 8 GB VRAM / 16 GB RAM laptops into WDDM TDR (`0x887A0007`).
 #[cfg(windows)]
 pub(crate) fn room_for_bake(memory: Option<[u64; 4]>) -> bool {
     match memory {
-        Some([budget, used, ..]) if budget > 0 => {
-            used.saturating_sub(crate::pool::texture_room()) < budget / 100 * 96
+        Some([budget, used, shared_budget, shared_used]) if budget > 0 => {
+            if u128::from(used) * 100 >= u128::from(budget) * 96 {
+                return false;
+            }
+            if shared_budget > 0 && u128::from(shared_used) * 100 >= u128::from(shared_budget) * 88 {
+                return false;
+            }
+            used.saturating_sub(crate::pool::texture_room()) < budget / 100 * 93
         }
         _ => true,
     }
@@ -1816,7 +1831,7 @@ pub(crate) fn room_for_bake(memory: Option<[u64; 4]>) -> bool {
 
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (auto-scaled: 1,280 MiB
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (auto-scaled: 1,792 MiB
 /// on Series S, 2,048 MiB on <= 10 GiB Series X, 3,072 MiB on > 10 GiB Series X;
 /// 0: none, as before) less what such copies hold now.
 ///
@@ -1843,9 +1858,10 @@ pub(crate) fn targets_room_kept() -> u64 {
             .map(|mb| mb.min(8192) << 20)
             .unwrap_or_else(|| {
                 if crate::console::current() == crate::console::Console::SeriesS {
-                    // Series S renders at 1080p-1440p (~1.0-1.3 GiB of targets):
-                    // keeping 3 GiB locked away starved textures & bakes on 8 GB GPUs.
-                    1280 << 20
+                    // Series S 1080p render targets + depth twins + TAA/lighting
+                    // reach ~1.8-2.2 GiB in cutscenes/world: keeping 1,792 MiB
+                    // prevents 8 GB GPUs from overflowing DXGI budget (7.14 GiB).
+                    1792 << 20
                 } else {
                     let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b);
                     if budget.is_some_and(|b| b <= 10 << 30) {
@@ -1896,10 +1912,10 @@ fn room_percent() -> u64 {
             .map(|percent| percent.clamp(50, 97))
             .unwrap_or_else(|| {
                 let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b);
-                if crate::console::current() == crate::console::Console::SeriesS
-                    && budget.is_some_and(|b| b <= 10 << 30)
-                {
-                    93
+                if budget.is_some_and(|b| b <= 10 << 30) {
+                    // Keep 8 GB GPUs (7.14 GiB DXGI budget) under ~88% so WDDM
+                    // does not spill textures to PCIe and trigger eviction thrash.
+                    88
                 } else {
                     90
                 }

@@ -2427,9 +2427,40 @@ impl State {
                     }
                     let _pass = crate::heap_worker::on().then(crate::heap_worker::urgent);
                     BAKE_SERVED.store(0, Ordering::Relaxed);
-                    PASS_BUDGET.set(Some((left, 2 << 30, true)));
-                    served = Self::heap_textures(Into::List(bake_list), heap, host, Some(&mut sync));
-                    PASS_BUDGET.set(None);
+                    // Chunk synchronous bake uploads into bounded submissions
+                    // (64 MiB on 8 GB VRAM / 16 GB RAM laptops, 128 MiB on larger
+                    // systems) so one bake never stages ~1.5 GiB / 7,500+ copies
+                    // into a single command list and triggers WDDM TDR (0x887A0007).
+                    let small_mem = crate::residency::tight_host_ram()
+                        || gpu.video_memory().is_some_and(|[budget, ..]| budget <= 10u64 << 30);
+                    let chunk_bytes: u64 = if small_mem { 64 << 20 } else { 128 << 20 };
+                    loop {
+                        let elapsed_ms = began.elapsed().as_millis() as u64;
+                        let chunk_ms = left.saturating_sub(elapsed_ms);
+                        if chunk_ms == 0 || crate::residency::upload_refused() {
+                            break;
+                        }
+                        PASS_BUDGET.set(Some((chunk_ms, chunk_bytes, true)));
+                        served = Self::heap_textures(Into::List(bake_list), heap, host, Some(&mut sync));
+                        PASS_BUDGET.set(None);
+                        let ran = bake_list.has_recorded_work();
+                        if ran {
+                            bake_list.close();
+                            gpu.execute_sync_internal(bake_list);
+                            bake_list.reset();
+                        } else if !sync.publish.is_empty() {
+                            crate::host::settle_for_fence();
+                        }
+                        for (index, handle, key) in sync.publish.drain(..) {
+                            let _ = host.publish_uploaded_slot(index, handle, key);
+                        }
+                        host.texture_views_remade();
+                        host.texture_slots_flip();
+                        sync.keep.clear();
+                        if served || !ran {
+                            break;
+                        }
+                    }
                 }
                 crate::texture::BAKING.set(false);
                 if bake_list.has_recorded_work() {
@@ -2741,8 +2772,12 @@ impl State {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
+        let mut uploaded_this_pass = 0usize;
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most
+                || began.elapsed() > span
+                || (sync.is_some() && uploaded_this_pass >= 256)
+            {
                 served = false;
                 break;
             }
@@ -3166,6 +3201,7 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            uploaded_this_pass += 1;
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {

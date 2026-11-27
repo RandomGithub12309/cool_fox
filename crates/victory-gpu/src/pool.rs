@@ -43,7 +43,17 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let vram_high = memory.is_some_and(|[budget, used, ..]| {
+        budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90
+    });
+    let shared_high = memory.is_some_and(|[_, _, sbudget, sused]| {
+        sbudget > 0 && u128::from(sused) * 100 >= u128::from(sbudget) * 78
+    });
+    let limit = if vram_high {
+        0
+    } else {
+        spares(memory, crate::host::keep_freed() && !pressure)
+    };
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
@@ -52,7 +62,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
+        let staging_limit = if crate::residency::critical_commit() || shared_high {
             0
         } else if pressure {
             1
