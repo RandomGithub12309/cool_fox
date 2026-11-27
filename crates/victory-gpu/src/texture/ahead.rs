@@ -107,18 +107,18 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
     let tight = crate::residency::tight_host_ram();
     let mem = crate::host::host().and_then(|h| h.video_memory());
     let vram_tight = mem.is_some_and(|[b, u, sb, su]| {
-        (b > 0 && u128::from(u) * 100 >= u128::from(b) * 88)
-            || (sb > 0 && u128::from(su) * 100 >= u128::from(sb) * 78)
+        (b > 0 && u128::from(u) * 100 >= u128::from(b) * 94)
+            || (sb > 0 && u128::from(su) * 100 >= u128::from(sb) * 90)
     });
     let most = if tight {
-        16 << 20
-    } else if crate::residency::limited_host_ram() {
         32 << 20
+    } else if crate::residency::limited_host_ram() {
+        48 << 20
     } else {
         MOST
     };
     if vram_tight
-        || crate::residency::pressured()
+        || crate::residency::critical_commit()
         || !crate::residency::allow_staging_growth(false)
         || BYTES.load(Relaxed) >= most
         || copy.flags() & 0x7 != 0
@@ -218,7 +218,7 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     .ok()?
             };
             let small_vram = host.video_memory().is_some_and(|[b, ..]| b <= 10 << 30);
-            let max_workers = if small_vram || crate::residency::tight_host_ram() { 2 } else { 6 };
+            let max_workers = if small_vram || crate::residency::tight_host_ram() { 4 } else { 6 };
             let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 3).clamp(2, max_workers));
             for n in 0..workers {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;

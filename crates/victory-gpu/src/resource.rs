@@ -1791,14 +1791,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // What is kept for card copies of title buffers not made yet
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used. Never admit new textures when real local VRAM is already at
-        // >= 94% of DXGI budget or shared GPU memory is >= 82% of budget
-        // (prevents WDDM VRAM thrashing & 0x887A0007 TDR on 8 GB GPUs).
+        // used. Enforce a hard ceiling only near physical exhaustion (>= 97%
+        // local VRAM or >= 92% shared GPU memory) so textures use available
+        // GDDR7 without going black and never overflow DXGI budget into TDR.
         Some([budget, used, shared_budget, shared_used]) => {
-            if budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 94 {
+            if budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 97 {
                 return false;
             }
-            if shared_budget > 0 && u128::from(shared_used) * 100 >= u128::from(shared_budget) * 82 {
+            if shared_budget > 0 && u128::from(shared_used) * 100 >= u128::from(shared_budget) * 92 {
                 return false;
             }
             used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
@@ -1810,20 +1810,20 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 
 /// VRAM admission check for one-shot character decoration/skin bakes: checks
 /// real local VRAM and shared GPU memory usage instead of subtracting
-/// speculative future target reservations, while still enforcing a hard
-/// physical ceiling (96% local VRAM, 88% shared GPU memory) so bakes never
-/// push 8 GB VRAM / 16 GB RAM laptops into WDDM TDR (`0x887A0007`).
+/// speculative future target reservations, while enforcing a hard physical
+/// ceiling (98% local VRAM, 95% shared GPU memory) so bakes never push 8 GB
+/// VRAM / 16 GB RAM laptops past DXGI budget into WDDM TDR (`0x887A0007`).
 #[cfg(windows)]
 pub(crate) fn room_for_bake(memory: Option<[u64; 4]>) -> bool {
     match memory {
         Some([budget, used, shared_budget, shared_used]) if budget > 0 => {
-            if u128::from(used) * 100 >= u128::from(budget) * 96 {
+            if u128::from(used) * 100 >= u128::from(budget) * 98 {
                 return false;
             }
-            if shared_budget > 0 && u128::from(shared_used) * 100 >= u128::from(shared_budget) * 88 {
+            if shared_budget > 0 && u128::from(shared_used) * 100 >= u128::from(shared_budget) * 95 {
                 return false;
             }
-            used.saturating_sub(crate::pool::texture_room()) < budget / 100 * 93
+            used.saturating_sub(crate::pool::texture_room()) < budget / 100 * 95
         }
         _ => true,
     }
@@ -1859,9 +1859,8 @@ pub(crate) fn targets_room_kept() -> u64 {
             .unwrap_or_else(|| {
                 if crate::console::current() == crate::console::Console::SeriesS {
                     // Series S 1080p render targets + depth twins + TAA/lighting
-                    // reach ~1.8-2.2 GiB in cutscenes/world: keeping 1,792 MiB
-                    // prevents 8 GB GPUs from overflowing DXGI budget (7.14 GiB).
-                    1792 << 20
+                    // leave ample room at 1,536 MiB without starving world textures.
+                    1536 << 20
                 } else {
                     let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b);
                     if budget.is_some_and(|b| b <= 10 << 30) {
@@ -1913,9 +1912,9 @@ fn room_percent() -> u64 {
             .unwrap_or_else(|| {
                 let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b);
                 if budget.is_some_and(|b| b <= 10 << 30) {
-                    // Keep 8 GB GPUs (7.14 GiB DXGI budget) under ~88% so WDDM
-                    // does not spill textures to PCIe and trigger eviction thrash.
-                    88
+                    // Utilize up to 92% of 8 GB DXGI budget (~6.57 GiB / 7.14 GiB)
+                    // for streamed textures while staying under the 97% hard cap.
+                    92
                 } else {
                     90
                 }

@@ -114,10 +114,14 @@ fn next_pressure_for(was: bool, physical: u64, commit: u64, tight: bool) -> bool
     if !tight {
         return next_pressure(was, physical, commit);
     }
+    // On 16 GB Windows 11 laptops, OS standby caching keeps `physical` around
+    // 1.5–2.0 GiB even while `commit` headroom exceeds 20 GiB. Trigger pressure
+    // only on genuinely low physical RAM (<= 1 GiB) or commit (<= 2 GiB) so
+    // background texture streaming is not permanently throttled at boot.
     if was {
-        physical < 3584 * MIB || commit < 4 * GIB
+        physical < 2 * GIB || commit < 3 * GIB
     } else {
-        physical <= 2 * GIB || commit <= 2560 * MIB
+        physical <= GIB || commit <= 2 * GIB
     }
 }
 
@@ -203,13 +207,13 @@ mod tests {
         assert!(next_pressure(true, 6 * GIB, 5 * GIB));
         assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
         assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
-        // Tight-RAM hosts (<= 20 GiB, e.g. 16 GB laptops): enter at <= 2 GiB phys
-        // or <= 2.5 GiB commit, recover at >= 3.5 GiB phys and >= 4 GiB commit.
-        assert!(!next_pressure_for(false, 3 * GIB, 4 * GIB, true));
-        assert!(next_pressure_for(false, 2 * GIB, 6 * GIB, true));
+        // Tight-RAM hosts (<= 20 GiB, e.g. 16 GB laptops): enter at <= 1 GiB phys
+        // or <= 2 GiB commit, recover at >= 2 GiB phys and >= 3 GiB commit.
+        assert!(!next_pressure_for(false, 2 * GIB, 4 * GIB, true));
+        assert!(next_pressure_for(false, GIB, 6 * GIB, true));
         assert!(next_pressure_for(false, 5 * GIB, 2 * GIB, true));
-        assert!(next_pressure_for(true, 3 * GIB, 5 * GIB, true));
-        assert!(!next_pressure_for(true, (7 * GIB) / 2, 4 * GIB, true));
+        assert!(next_pressure_for(true, 3 * GIB, 2 * GIB, true));
+        assert!(!next_pressure_for(true, 2 * GIB, 3 * GIB, true));
     }
 
     #[test]

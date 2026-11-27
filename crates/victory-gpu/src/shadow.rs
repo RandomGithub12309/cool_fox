@@ -331,8 +331,19 @@ pub(crate) fn card_room_kept() -> u64 {
     // 5 GB that never came (941 MB in 97 copies after fifteen minutes), and
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
-    const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    // On Series S / <= 10 GiB cards, card buffers top out around ~480–600 MiB,
+    // so capping the speculative reservation at 640 MiB avoids locking away
+    // ~540 MiB of ghost VRAM that starves world textures to black.
+    let seen = if crate::console::current() == crate::console::Console::SeriesS
+        || crate::host::host()
+            .and_then(|h| h.video_memory())
+            .is_some_and(|[budget, ..]| budget <= 10u64 << 30)
+    {
+        640 << 20
+    } else {
+        1 << 30
+    };
+    card_limits().1.min(seen).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
 /// The copies in the card's memory.
@@ -1456,23 +1467,18 @@ fn for_pieces_of(from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
 /// # Safety
 /// Both ranges are valid for `len` bytes and do not overlap.
 unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
-    const PER_THREAD: usize = 16 << 20;
-    let threads = (len / PER_THREAD).clamp(1, 6);
-    if threads == 1 {
+    if len < 2 * WIDE_JOB {
         // SAFETY: the caller's.
         unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
         return;
     }
-    let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
-    std::thread::scope(|s| {
-        for i in 0..threads {
-            let at = (i * each).min(len);
-            let n = each.min(len - at);
-            s.spawn(move || {
-                // SAFETY: a part of the caller's ranges.
-                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
-            });
-        }
+    let chunks = len.div_ceil(WIDE_JOB);
+    let (src, dst) = (src as usize, dst as usize);
+    crate::land::each_wide(chunks, &move |i| {
+        let at = i * WIDE_JOB;
+        let n = WIDE_JOB.min(len - at);
+        // SAFETY: disjoint slices of the caller's non-overlapping ranges.
+        unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
     });
 }
 
@@ -1505,80 +1511,16 @@ pub(crate) fn wide_back() -> bool {
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// Threads kept for [`wide`]: what they are to do, and the word that there
-/// is something.
-struct Workers {
-    jobs: Mutex<std::collections::VecDeque<Job>>,
-    more: std::sync::Condvar,
-    /// How many jobs there are, for [`spin`].
-    there: std::sync::atomic::AtomicUsize,
-}
+/// Lock-free single-claim slot for dispatching `FnOnce` jobs onto `land::each_wide`
+/// (each index is claimed at most once via atomic `fetch_add` work stealing).
+struct JobSlot(std::cell::UnsafeCell<Option<Job>>);
 
-/// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
-/// most (defaults to 50 us on >= 12-core CPUs, 0 otherwise): asleep, a thread
-/// is woken in 50 us and more, 95 times a frame.
-fn spin(there: impl Fn() -> bool) {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WIDE_SPIN")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or_else(|| if std::thread::available_parallelism().is_ok_and(|n| n.get() >= 12) { 50 } else { 0 })
-    });
-    if most == 0 {
-        return;
-    }
-    let began = std::time::Instant::now();
-    while !there() && (began.elapsed().as_micros() as u64) < most {
-        for _ in 0..16 {
-            std::hint::spin_loop();
-        }
-    }
-}
+// SAFETY: `each_wide` guarantees every index `0..len` is visited by at most one thread.
+unsafe impl Sync for JobSlot {}
 
-/// How many threads are kept for [`wide`].
-fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 10)
-}
-
-fn workers() -> &'static Workers {
-    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let workers = WORKERS.get_or_init(|| Workers {
-        jobs: Mutex::new(std::collections::VecDeque::new()),
-        more: std::sync::Condvar::new(),
-        there: std::sync::atomic::AtomicUsize::new(0),
-    });
-    STARTED.call_once(|| {
-        for i in 0..wide_threads() {
-            let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
-                crate::cores::keep_helper_on_fast_cores("victory-wide");
-                let workers = WORKERS.get().expect("made above");
-                loop {
-                    let job = {
-                        // A little while awake first: the next work comes
-                        // within microseconds more often than not.
-                        spin(|| workers.there.load(Ordering::Acquire) > 0);
-                        let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-                        loop {
-                            if let Some(job) = jobs.pop_front() {
-                                workers.there.fetch_sub(1, Ordering::AcqRel);
-                                break job;
-                            }
-                            jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
-                        }
-                    };
-                    let _working = crate::timeline::span("a job for another thread");
-                    job();
-                }
-            });
-        }
-    });
-    workers
-}
-
-/// Runs `jobs` on the kept threads and on this one, and returns when all
-/// of them are done. The jobs copy and compare memory; they do not panic.
+/// Runs `jobs` on the lock-free `victory-wide` pool and on this thread, and
+/// returns when all of them are done. The jobs copy and compare memory; they
+/// do not panic.
 fn wide(jobs: Vec<Job>) {
     if jobs.len() < 2 {
         for job in jobs {
@@ -1586,40 +1528,15 @@ fn wide(jobs: Vec<Job>) {
         }
         return;
     }
-    let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
-    {
-        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        for job in jobs {
-            let left = left.clone();
-            workers.there.fetch_add(1, Ordering::AcqRel);
-            queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
-            }));
+    let slots: Vec<JobSlot> = jobs.into_iter().map(|j| JobSlot(std::cell::UnsafeCell::new(Some(j)))).collect();
+    crate::land::each_wide(slots.len(), &|i| {
+        // SAFETY: `each_wide` delivers each index `i` to exactly one thread.
+        if let Some(job) = unsafe { (*slots[i].0.get()).take() } {
+            let _working = crate::timeline::span("a job for another thread");
+            job();
         }
-    }
-    workers.more.notify_all();
-    loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-        match job {
-            Some(job) => {
-                workers.there.fetch_sub(1, Ordering::AcqRel);
-                job()
-            }
-            None => break,
-        }
-    }
-    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
-    }
+    });
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's
@@ -1635,8 +1552,9 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
     crate::land::each_wide(n, &work);
 }
 
-/// About this many bytes to a piece of work for [`wide`].
-const WIDE_JOB: usize = 1 << 20;
+/// About this many bytes to a piece of work for [`wide`]: 512 KiB spreads
+/// medium snapshots and refreshes evenly across 16+ physical cores.
+const WIDE_JOB: usize = 512 << 10;
 
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].

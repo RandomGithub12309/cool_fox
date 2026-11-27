@@ -52,7 +52,9 @@ fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
         let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
-        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 3).clamp(2, 8)).clamp(1, 16)
+        asked
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| (n.get() * 2 / 3).clamp(4, 14)))
+            .clamp(1, 16)
     })
 }
 
@@ -454,24 +456,24 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
 }
 
-/// [`Pool::each`] on threads kept for parallel host refreshes, fills, and
-/// texture refreshes (`crate::shadow::wide_each`), avoiding per-batch heap
-/// allocations and queue-mutex contention.
+/// [`Pool::each`] on threads kept for parallel host refreshes, fills, snapshots,
+/// and texture refreshes (`crate::shadow::wide_each` / `wide`), scaling across
+/// up to 16 physical cores on hybrid 20-core CPUs.
 pub(crate) fn each_wide(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::thread::available_parallelism().map_or(5, |n| (n.get() / 2).clamp(3, 10));
+        let threads = std::thread::available_parallelism().map_or(6, |n| (n.get() * 3 / 4).clamp(4, 16));
         Pool::new("victory-wide", threads)
     })
     .each(count, f);
 }
 
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes
-/// (`VICTORY_UNDER_THREADS`, scales up to 10 on high-core CPUs).
+/// (`VICTORY_UNDER_THREADS`, scales up to 16 on high-core CPUs).
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let default = std::thread::available_parallelism().map_or(6, |n| (n.get() / 2).clamp(6, 10));
+        let default = std::thread::available_parallelism().map_or(6, |n| (n.get() * 3 / 4).clamp(6, 16));
         let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
         Pool::new("victory-under", threads.clamp(1, 16))
     })
@@ -479,7 +481,7 @@ pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
 }
 
 /// Calls `f` with every number below `count`, on this thread and on threads
-/// kept for making descriptors (`VICTORY_VIEW_THREADS`, scales up to 8/10 on
+/// kept for making descriptors (`VICTORY_VIEW_THREADS`, scales up to 12/16 on
 /// high-core CPUs; 1: on this one alone). Those for `records`, the heaps'
 /// records copied as bytes, are others than those for the views picked by
 /// index: submissions wait for the first, lists for the second, and each
@@ -489,7 +491,7 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
     POOLS[usize::from(records)]
         .get_or_init(|| {
             let cpus = std::thread::available_parallelism().map_or(6, |n| n.get());
-            let default = if records { (cpus / 2).clamp(6, 10) } else { (cpus / 3).clamp(4, 8) };
+            let default = if records { (cpus * 3 / 4).clamp(6, 16) } else { (cpus / 2).clamp(4, 12) };
             let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default);
             Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
         })

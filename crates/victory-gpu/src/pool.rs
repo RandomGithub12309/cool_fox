@@ -44,10 +44,10 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
     let vram_high = memory.is_some_and(|[budget, used, ..]| {
-        budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 90
+        budget > 0 && u128::from(used) * 100 >= u128::from(budget) * 94
     });
     let shared_high = memory.is_some_and(|[_, _, sbudget, sused]| {
-        sbudget > 0 && u128::from(sused) * 100 >= u128::from(sbudget) * 78
+        sbudget > 0 && u128::from(sused) * 100 >= u128::from(sbudget) * 88
     });
     let limit = if vram_high {
         0
