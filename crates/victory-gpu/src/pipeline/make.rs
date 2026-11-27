@@ -448,6 +448,9 @@ struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
+    /// Previously used depth-only / shadow-map pipelines warmed ahead of
+    /// speculative material pipelines so shadows do not drop during loading.
+    early_depth: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
@@ -460,6 +463,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
+            early_depth: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
@@ -485,6 +489,8 @@ impl Queue {
             self.requested.push_back(p.clone());
         } else if slow {
             self.slow.push_back(p.clone());
+        } else if p.graphics.as_ref().is_some_and(|state| state.writes_depth_only()) {
+            self.early_depth.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
@@ -498,7 +504,11 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self
+                .requested
+                .pop_front()
+                .or_else(|| unclaimed(&mut self.early_depth))
+                .or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {

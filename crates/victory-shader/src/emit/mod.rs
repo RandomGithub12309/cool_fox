@@ -415,6 +415,31 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
         }
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_ops_on_numbers(|| translate_plain(container))
+        }
+        other => other,
+    }
+}
+
+/// [`emit`] with the same second tries as [`translate`] (first halves of
+/// interpolations as pairs, mask operations on numbers), for tools that
+/// run the stages themselves.
+pub fn emit_with_retries(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    match emit(c, native, p, st, io, res) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::with_first_half_pairs(|| emit(c, native, p, st, io, res))
+        }
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_ops_on_numbers(|| emit(c, native, p, st, io, res))
+        }
         other => other,
     }
 }

@@ -91,6 +91,15 @@ impl Default for GraphicsState {
     }
 }
 
+impl GraphicsState {
+    pub(super) fn writes_depth_only(&self) -> bool {
+        self.targets.NumRenderTargets == 0
+            && self.depth_format != DXGI_FORMAT_UNKNOWN
+            && self.depth.DepthEnable.as_bool()
+            && self.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
+    }
+}
+
 /// Integer render target formats: D3D12 cannot blend into them.
 fn integer_format(f: DXGI_FORMAT) -> bool {
     matches!(
